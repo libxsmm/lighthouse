@@ -42,10 +42,14 @@ elif [[ $GPU_TYPE == *"Intel"* ]]; then
   fi
 else
   echo "No GPU support detected, installing CPU version."
-  exit 1
+  pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cpu
+  if [ $? != 0 ]; then
+    exit 1
+  fi
 fi
 
 echo "Installing torch-mlir"
+# This only seems to work on Ubuntu
 pip3 install --pre torch-mlir \
   --extra-index-url https://download.pytorch.org/whl/nightly/cpu \
   -f https://github.com/llvm/torch-mlir-release/releases/expanded_assets/dev-wheels
