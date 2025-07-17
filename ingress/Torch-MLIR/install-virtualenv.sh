@@ -17,33 +17,28 @@ source torch-mlir-venv/bin/activate
 python -m pip install --upgrade pip wheel
 
 # GPU support ("AMD", "NVIDIA", "Intel")
+EXTRA_INDEX_URL=""
 if [[ $DEVICE_TYPE == *"NVIDIA"* ]]; then
   # This is the default pytorch
   echo "Installing PyTorch for GPU: NVIDIA"
-  pip3 install torch torchvision torchaudio transformers
-  if [ $? != 0 ]; then
-    exit 1
-  fi
 elif [[ $DEVICE_TYPE == *"AMD"* ]]; then
   # https://rocm.docs.amd.com/projects/radeon/en/latest/docs/install/native_linux/install-pytorch.html
   echo "Installing PyTorch for GPU: AMD"
-  pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm6.4/
-  if [ $? != 0 ]; then
-    exit 1
-  fi
+  EXTRA_INDEX_URL="--extra-index-url https://download.pytorch.org/whl/rocm6.4"
 elif [[ $DEVICE_TYPE == *"Intel"* ]]; then
   echo "Installing PyTorch for GPU: Intel"
-  pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
-  if [ $? != 0 ]; then
-    exit 1
-  fi
+  EXTRA_INDEX_URL="--index-url https://download.pytorch.org/whl/xpu"
 else
   echo "No GPU support detected, installing CPU version."
-  pip install torch torchvision torchaudio transformers --extra-index-url https://download.pytorch.org/whl/cpu
-  if [ $? != 0 ]; then
-    exit 1
-  fi
+  EXTRA_INDEX_URL="--extra-index-url https://download.pytorch.org/whl/cpu"
 fi
+
+echo "Installing torch and models"
+pip3 install --pre torch torchvision torchrec transformers $EXTRA_INDEX_URL
+if [ $? != 0 ]; then
+  exit 1
+fi
+
 
 echo "Installing torch-mlir"
 # This only seems to work on Ubuntu
