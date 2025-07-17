@@ -31,27 +31,28 @@ def load_torch_model(model_path):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file {model_path} does not exist.")
     
-    model = torch.load(model_path, map_location=torch.device("cpu"))
+    model = torch.load(model_path)
     return model
 
 # Function to generate MLIR from the Torch model
 # See: https://github.com/MrSidims/PytorchExplorer/blob/main/backend/server.py#L237
 def generate_mlir(model, dialect):
-    import torch_mlir
 
     # Convert the Torch model to MLIR
+    output_type = None
     if dialect == "torch":
-        mlir_module = torch_mlir.compile(model, output_type="torch")
+        output_type = OutputType.TORCH
     elif dialect == "linalg":
-        mlir_module = torch_mlir.compile(model, output_type="linalg")
+        output_type = OutputType.LINALG
     elif dialect == "stablehlo":
-        mlir_module = torch_mlir.compile(model, output_type="stablehlo")
+        output_type = OutputType.STABLEHLO
     elif dialect == "tosa":
-        mlir_module = torch_mlir.compile(model, output_type="tosa")
+        output_type = OutputType.TOSA
     else:
         raise ValueError(f"Unsupported dialect: {dialect}")
 
-    return mlir_module
+    module = fx.export_and_import(model, "", output_type=output_type)
+    return module
 
 # Main function to execute the script
 def main():
