@@ -2,7 +2,6 @@ name: Intel LLVM Build
 
 on:
   workflow_dispatch:
-  push:
   workflow_call:
 
 env:
