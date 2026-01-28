@@ -1,0 +1,34 @@
+name: Update Repository
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    - cron: '0 0 * * *'  # Daily at midnight UTC
+
+jobs:
+  Update-Repo:
+    runs-on: pcl-tiergarten
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # Fetch entire history to ensure rebasing works
+
+      - name: Configure Git Repository
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+
+      - name: Update from Upstream
+        run: |
+          git fetch https://github.com/llvm/lighthouse.git main
+          git checkout -B main FETCH_HEAD
+          git push origin main
+
+      - name: Rebase Intel-CI
+        run: |
+          git fetch origin intel-ci
+          git checkout -B intel-ci FETCH_HEAD
+          git rebase main
+          git push origin intel-ci --force-with-lease
