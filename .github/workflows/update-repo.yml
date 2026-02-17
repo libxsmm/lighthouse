@@ -3,6 +3,7 @@ name: Update Repository
 on:
   workflow_dispatch:
   workflow_call:
+  push:
   schedule:
     - cron: '0 0 * * *'  # Daily at midnight UTC
 
