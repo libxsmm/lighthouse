@@ -1,0 +1,28 @@
+name: Pull-rebase upstream main branch
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'  # Daily at midnight UTC
+
+jobs:
+  Update-Repo:
+    runs-on: pcl-tiergarten
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # Fetch entire history to ensure rebasing works
+
+      - name: Configure Git Repository
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+
+      - name: Pull-rebase upstream
+        run: |
+          git fetch origin main
+          git checkout -B main FETCH_HEAD
+          git fetch https://github.com/llvm/lighthouse.git main
+          git rebase FETCH_HEAD
+          git push origin main
