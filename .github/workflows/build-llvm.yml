@@ -12,7 +12,7 @@ jobs:
   MLIR-LLVM-INTEL:
     runs-on: pcl-tiergarten
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: LLVM Intel
         run: |-
               GPU=intel intel-ci/check_llvm.sh || \
