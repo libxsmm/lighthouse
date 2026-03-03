@@ -1,0 +1,16 @@
+name: Run XeGPU test
+description: Run a XeGPU command through srun
+
+inputs:
+  command:
+    description: Command to execute
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+        ${{ env.SRUN }} --partition=b70 --time=0:30:00 -- \
+          ${{ inputs.command }}

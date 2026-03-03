@@ -1,0 +1,130 @@
+name: Lighthouse Intel XeGPU
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+env:
+  NPROCS_LIMIT_LINK: 8
+  SRUN: ${HOME}/srun.sh
+
+jobs:
+  Check_LLVM:
+    uses: ./.github/workflows/build-llvm.yml
+    secrets: inherit
+
+  XeGPU_Examples:
+    runs-on: pcl-tiergarten
+    needs: Check_LLVM
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install the project and its dependencies
+        run: |
+          uv sync --extra ingress-torch-cpu
+
+      - name: Run XeGPU matmul example
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/matmul.py --check-result --init-int
+
+      - name: Run XeGPU matmul example without check
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/matmul.py
+
+      - name: Run XeGPU matmul example with bias
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/matmul.py --check-result --init-int --bias
+
+      - name: Run XeGPU matmul example with relu
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/matmul.py --check-result --init-int --relu
+
+      - name: Run XeGPU matmul example with no accumulation
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/matmul.py --check-result --init-int --no-accumulate-c
+
+      - name: Run XeGPU matmul example with bias and relu
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/matmul.py --check-result --init-int --bias --relu
+
+      - name: Run XeGPU matmul example with bias, relu and no accumulation
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/matmul.py --check-result --init-int --bias --relu --no-accumulate-c
+
+      - name: Run XeGPU MLP example default
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/mlp.py --check-result
+
+      - name: Run XeGPU MLP example
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/mlp.py --hidden-sizes 1024 1024 --check-result
+
+      - name: Run XeGPU MLP example without check
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/mlp.py --hidden-sizes 1024 1024
+
+      - name: Run XeGPU MLP example with bias
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/mlp.py --hidden-sizes 1024 1024 --check-result --bias
+
+      - name: Run XeGPU MLP example with relu
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/mlp.py --hidden-sizes 1024 1024 --check-result --relu
+
+      - name: Run XeGPU MLP example with bias and relu
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/mlp.py --hidden-sizes 1024 1024 --check-result --bias --relu
+
+      - name: Run XeGPU MLP example with bias, relu and accumulation
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/mlp.py --hidden-sizes 1024 1024 --check-result --bias --relu --accumulate-c
+
+      - name: Run XeGPU Softmax example
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/softmax.py --check-result
+
+      - name: Run XeGPU Layer Norm example
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/layer_norm.py --check-result
+
+      - name: Run XeGPU Fused attention example
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/fused_attention.py --check-result
+
+      # Disabled due to a segfault
+      # - name: Run XeGPU nanoGPT example
+      #   uses: ./.github/actions/run-xegpu-test
+      #   with:
+      #     command: uv run python examples/xegpu/nanoGPT.py --check
+
+      # Disabled because requires xpu-enable torch
+      # - name: Run XeGPU Torch Matmul example
+      #   uses: ./.github/actions/run-xegpu-test
+      #   with:
+      #     command: uv run python examples/xegpu/torch_matmul.py --check-result --nruns 100
+
+      - name: Run XeGPU Kernel Bench level1-1 example
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/kernel_bench.py -l 1 -b 1
