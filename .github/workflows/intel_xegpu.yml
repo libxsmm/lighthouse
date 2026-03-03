@@ -31,10 +31,34 @@ jobs:
         run: |
           GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
           ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
-          uv run python examples/xegpu_matmul/matmul.py --check-result
+          uv run python examples/xegpu/matmul.py --check-result
 
       - name: Run XeGPU matmul example with relu
         run: |
           GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
           ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
-          uv run python examples/xegpu_matmul/matmul.py --check-result --relu
+          uv run python examples/xegpu/matmul.py --check-result --relu
+
+      - name: Run XeGPU matmul example with relu and no accumulation
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/matmul.py --check-result --relu --no-accumulate-c
+
+      - name: Run XeGPU MLP example
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/mlp.py --check-result
+
+      - name: Run XeGPU MLP example with relu
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/mlp.py --check-result --relu
+
+      - name: Run XeGPU MLP example with relu and accumulation
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/mlp.py --check-result --relu --accumulate-c
