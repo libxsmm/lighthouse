@@ -14,14 +14,14 @@ jobs:
     uses: ./.github/workflows/build-llvm.yml
     secrets: inherit
 
-  XeGPU_Matmul:
+  XeGPU_Examples:
     runs-on: pcl-tiergarten
     needs: Check_LLVM
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
 
       - name: Install the project and its dependencies
         run: |
@@ -31,10 +31,82 @@ jobs:
         run: |
           GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
           ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
-          uv run python examples/xegpu_matmul/matmul.py --check-result
+          uv run python examples/xegpu/matmul.py --check-result
+
+      - name: Run XeGPU matmul example without check
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/matmul.py
+
+      - name: Run XeGPU matmul example with bias
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/matmul.py --check-result --bias
 
       - name: Run XeGPU matmul example with relu
         run: |
           GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
           ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
-          uv run python examples/xegpu_matmul/matmul.py --check-result --relu
+          uv run python examples/xegpu/matmul.py --check-result --relu
+
+      - name: Run XeGPU matmul example with no accumulation
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/matmul.py --check-result --no-accumulate-c
+
+      - name: Run XeGPU matmul example with bias and relu
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/matmul.py --check-result --bias --relu
+
+      - name: Run XeGPU matmul example with bias, relu and no accumulation
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/matmul.py --check-result --bias --relu --no-accumulate-c
+
+      - name: Run XeGPU MLP example default
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/mlp.py --check-result
+
+      - name: Run XeGPU MLP example
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/mlp.py --hidden-sizes 1024 1024 --check-result
+
+      - name: Run XeGPU MLP example without check
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/mlp.py --hidden-sizes 1024 1024
+
+      - name: Run XeGPU MLP example with bias
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/mlp.py --hidden-sizes 1024 1024 --check-result --bias
+
+      - name: Run XeGPU MLP example with relu
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/mlp.py --hidden-sizes 1024 1024 --check-result --relu
+
+      - name: Run XeGPU MLP example with bias and relu
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/mlp.py --hidden-sizes 1024 1024 --check-result --bias --relu
+
+      - name: Run XeGPU MLP example with bias, relu and accumulation
+        run: |
+          GPU=intel source intel-ci/set_gpu_runtime_env.sh && \
+          ${{ env.SRUN }} --partition=b580 --time=0:30:00 -- \
+          uv run python examples/xegpu/mlp.py --hidden-sizes 1024 1024 --check-result --bias --relu --accumulate-c
