@@ -18,7 +18,7 @@ fi
 # Env Intel setup
 if [[ ${GPU,,} =~ "intel" ]]; then
   echo "Setting up Intel XeGPU environment"
-  VERSION="26.05.37020.3"
+  VERSION="26.27.39122.11"
   echo "Using driver version ${VERSION}"
   source /swtools/intel-gpu/$VERSION/intel_gpu_vars.sh
   check_program iga64
