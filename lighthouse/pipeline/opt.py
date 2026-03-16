@@ -85,13 +85,12 @@ class Transform:
     to be easily passed to a TransformStage.
     """
 
-    def __init__(self, name: str, filename: str):
-        self.name = name
+    def __init__(self, filename: str):
         self.filename = filename
 
     def __str__(self) -> str:
-        """serialize name + filename for transform stage consumption"""
-        return f"{self.name}:{{{self.filename}}}"
+        """serialize filename for transform stage consumption"""
+        return f"{self.filename}"
 
 
 class Stage:
@@ -99,9 +98,6 @@ class Stage:
     A stage in the optimization pipeline. Each stage will apply a specific set of transformations to the module,
     and will keep track of the current state of the module after the transformations are applied.
     """
-
-    def __init__(self, name: str):
-        self.name = name
 
     @abstractmethod
     def apply(self, module: ir.Module) -> ir.Module:
@@ -116,8 +112,7 @@ class PassStage(Stage):
     A stage that applies a predefined set of passes to the module. This is a simple wrapper around a PassManager.
     """
 
-    def __init__(self, name: str, context: ir.Context, passes: list[Pass]):
-        super().__init__(name)
+    def __init__(self, passes: list[Pass], context: ir.Context):
         self.context = context
         self.pm = PassManager("builtin.module", self.context)
         add_bundle(self.pm, passes)
@@ -136,10 +131,7 @@ class TransformStage(Stage):
     A stage that applies a predefined set of transformations to the module. This is a simple wrapper around a Transform Schedule.
     """
 
-    def __init__(self, name: str, context: ir.Context, filename: str):
-        super().__init__(name)
-        # TODO: Import via Python when the file name ends with .py,
-        # and via MLIR when the file name ends with .mlir.
+    def __init__(self, filename: str, context: ir.Context):
         self.module = import_mlir_module(filename, context)
         if "transform.with_named_sequence" not in self.module.operation.attributes:
             raise ValueError(
@@ -191,20 +183,14 @@ class Driver:
             raise ValueError("Pipeline is fixed. Reset to start again.")
         # Pass Bundle
         if stage_name in self.bundles:
-            self.pipeline.append(
-                PassStage(
-                    self.bundles[stage_name], self.context, self.bundles[stage_name]
-                )
-            )
+            self.pipeline.append(PassStage(self.bundles[stage_name], self.context))
         # Transform
         elif os.path.exists(stage_name):
-            self.pipeline.append(TransformStage(stage_name, self.context, stage_name))
+            self.pipeline.append(TransformStage(stage_name, self.context))
         # Assume random strings represent a single pass
         # Will crash later if the pass name is not registered.
         else:
-            self.pipeline.append(
-                PassStage(stage_name, self.context, [Pass(stage_name)])
-            )
+            self.pipeline.append(PassStage([Pass(stage_name)], self.context))
 
     def add_stages(self, stages: list[str]) -> None:
         for s in stages:
