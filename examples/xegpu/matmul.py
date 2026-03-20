@@ -197,6 +197,7 @@ class XeGPUMatMul(XeGPUWorkload):
     def schedule_modules(
         self, stop_at_stage: Optional[str] = None, parameters: Optional[dict] = None
     ) -> list[ir.Module]:
+        assert parameters is not None, "Schedule parameters must be provided"
         return [
             get_bench_wrapper_schedule(self),
             get_schedule_module(
@@ -204,8 +205,7 @@ class XeGPUMatMul(XeGPUWorkload):
                 has_relu=self.has_relu,
                 has_convert_c=False,
                 stop_at_stage=stop_at_stage,
-                nlayers=1,
-                params={"layer_0": parameters},
+                params=[parameters],
             ),
         ]
 
@@ -217,6 +217,9 @@ def parse_cli():
     parser = argparse.ArgumentParser(
         description="Matrix Multiplication using MLIR",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--all-knobs", action="store_true", help="Use knobs for all schedule parameters"
     )
     parser.add_argument(
         "--sizes",
@@ -339,24 +342,28 @@ def parse_cli():
 if __name__ == "__main__":
     args = parse_cli()
 
+    M, N, K = args.sizes
+
     params = {
-        "wg_m": args.wg_tile[0],
-        "wg_n": args.wg_tile[1],
-        "sg_m": args.sg_tile[0],
-        "sg_n": args.sg_tile[1],
-        "k": args.k_tile,
-        "load_a_m": args.load_tile_a[0],
-        "load_a_k": args.load_tile_a[1],
-        "load_b_k": args.load_tile_b[0],
-        "load_b_n": args.load_tile_b[1],
-        "pf_a_m": args.prefetch_tile_a[0],
-        "pf_a_k": args.prefetch_tile_a[1],
-        "pf_b_k": args.prefetch_tile_b[0],
-        "pf_b_n": args.prefetch_tile_b[1],
-        "pf_nb": args.nb_prefetch,
+        "m": M,
+        "n": N,
+        "k": K,
+        "wg_m": None if args.all_knobs else args.wg_tile[0],
+        "wg_n": None if args.all_knobs else args.wg_tile[1],
+        "sg_m": None if args.all_knobs else args.sg_tile[0],
+        "sg_n": None if args.all_knobs else args.sg_tile[1],
+        "k_tile": None if args.all_knobs else args.k_tile,
+        "load_a_m": None if args.all_knobs else args.load_tile_a[0],
+        "load_a_k": None if args.all_knobs else args.load_tile_a[1],
+        "load_b_k": None if args.all_knobs else args.load_tile_b[0],
+        "load_b_n": None if args.all_knobs else args.load_tile_b[1],
+        "prefetch_a_m": None if args.all_knobs else args.prefetch_tile_a[0],
+        "prefetch_a_k": None if args.all_knobs else args.prefetch_tile_a[1],
+        "prefetch_b_k": None if args.all_knobs else args.prefetch_tile_b[0],
+        "prefetch_b_n": None if args.all_knobs else args.prefetch_tile_b[1],
+        "prefetch_nb": args.nb_prefetch,
     }
 
-    M, N, K = args.sizes
     ab_type = "f16"
     c_type = "f32"
 

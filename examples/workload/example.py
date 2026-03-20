@@ -21,7 +21,6 @@ from mlir.execution_engine import ExecutionEngine
 from lighthouse import dialects as lh_dialects
 from lighthouse.pipeline.helper import match
 from lighthouse.pipeline.opt import PassBundles, apply_bundle
-
 from lighthouse.workload import Workload, execute, benchmark, get_bench_wrapper_schedule
 
 

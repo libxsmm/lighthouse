@@ -69,7 +69,6 @@ class XeGPUMLP(XeGPUWorkload):
         layer_sizes = [self.input_size] + self.hidden_layer_sizes + [self.output_size]
         self.weight_shapes = list(zip(layer_sizes[:-1], layer_sizes[1:]))
         self.matmul_layers = [(self.batch_size, o, i) for i, o in self.weight_shapes]
-        self.nlayers = len(self.matmul_layers)
         self.identity_weights = identity_weights
         self.bias_shapes = [(o,) for o in layer_sizes[1:]] if has_bias else []
 
@@ -266,7 +265,6 @@ class XeGPUMLP(XeGPUWorkload):
                 has_relu=self.has_relu,
                 skip_final_layer_relu=True,
                 stop_at_stage=stop_at_stage,
-                nlayers=self.nlayers,
                 params=parameters,
             ),
         ]
