@@ -7,11 +7,12 @@
 # CHECK: module attributes {gpu.container_module} {
 
 """
-XeGPU matrix multiplication benchmark.
+XeGPU matrix multiplication example.
 """
 
 import argparse
 import ctypes
+import json
 from typing import Optional
 from functools import cached_property
 
@@ -30,6 +31,7 @@ from lighthouse.ingress.mlir_gen import (
 )
 
 from xegpu_workload import XeGPUWorkload, matmul_complexity
+import parameter_selector
 
 
 class XeGPUMatMul(XeGPUWorkload):
@@ -213,9 +215,10 @@ class XeGPUMatMul(XeGPUWorkload):
         return ["libmlir_levelzero_runtime.so"]
 
 
-def parse_cli():
+def cli_parser(description):
+    """CLI argument parser for args shared with autotuner."""
     parser = argparse.ArgumentParser(
-        description="Matrix Multiplication using MLIR",
+        description=description,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -227,72 +230,6 @@ def parse_cli():
         nargs=3,
         default=[4096, 4096, 4096],
         help="M,N,K matrix sizes (A=MxK, B=KxN, C=MxN).",
-    )
-    parser.add_argument(
-        "--wg-tile",
-        type=int,
-        nargs=2,
-        default=[256, 256],
-        help="Workgroup tile size M,N.",
-    )
-    parser.add_argument(
-        "--sg-tile",
-        type=int,
-        nargs=2,
-        default=[32, 32],
-        help="Subgroup tile size M,N.",
-    )
-    parser.add_argument(
-        "--k-tile",
-        type=int,
-        default=64,
-        help="Inner reduction dimension tile size K.",
-    )
-    parser.add_argument(
-        "--load-tile-a",
-        type=int,
-        nargs=2,
-        default=[32, 16],
-        help="Tile size for loading A matrix for DPAS op.",
-    )
-    parser.add_argument(
-        "--load-tile-b",
-        type=int,
-        nargs=2,
-        default=[32, 16],
-        help="Tile size for loading B matrix for DPAS op.",
-    )
-    parser.add_argument(
-        "--prefetch-tile-a",
-        type=int,
-        nargs=2,
-        default=[8, 32],
-        help="Tile size for cooperative prefetching of subgroup A matrix",
-    )
-    parser.add_argument(
-        "--prefetch-tile-b",
-        type=int,
-        nargs=2,
-        default=[16, 32],
-        help="Tile size for cooperative prefetching of subgroup B matrix",
-    )
-    parser.add_argument(
-        "--nb-prefetch",
-        type=int,
-        default=1,
-        help="Number of initial prefetches.",
-    )
-    parser.add_argument(
-        "--nruns",
-        type=int,
-        default=1000,
-        help="Number of runs to average the execution time.",
-    )
-    parser.add_argument(
-        "--nwarmup",
-        type=int,
-        default=20,
-        help="Number of warm-up iterations before benchmarking.",
     )
     parser.add_argument(
         "--bias",
@@ -309,10 +246,73 @@ def parse_cli():
         action="store_true",
         help="Compute plain matrix-multiply C=A*B instead of matrix-multiply-accumulate C+=A*B.",
     )
+    return parser
+
+
+def parse_cli_args(description):
+    parser = cli_parser(description=description)
+    parser.add_argument(
+        "--wg-tile",
+        type=int,
+        nargs=2,
+        help="Workgroup tile size M,N.",
+    )
+    parser.add_argument(
+        "--sg-tile",
+        type=int,
+        nargs=2,
+        help="Subgroup tile size M,N.",
+    )
+    parser.add_argument(
+        "--k-tile",
+        type=int,
+        help="Inner reduction dimension tile size K.",
+    )
+    parser.add_argument(
+        "--load-tile-a",
+        type=int,
+        nargs=2,
+        help="Tile size for loading A matrix for DPAS op.",
+    )
+    parser.add_argument(
+        "--load-tile-b",
+        type=int,
+        nargs=2,
+        help="Tile size for loading B matrix for DPAS op.",
+    )
+    parser.add_argument(
+        "--prefetch-tile-a",
+        type=int,
+        nargs=2,
+        help="Tile size for cooperative prefetching of subgroup A matrix",
+    )
+    parser.add_argument(
+        "--prefetch-tile-b",
+        type=int,
+        nargs=2,
+        help="Tile size for cooperative prefetching of subgroup B matrix",
+    )
+    parser.add_argument(
+        "--prefetch-nb",
+        type=int,
+        help="Number of initial prefetches.",
+    )
     parser.add_argument(
         "--check-result",
         action="store_true",
         help="Check the result of the matrix multiplication.",
+    )
+    parser.add_argument(
+        "--nruns",
+        type=int,
+        default=1000,
+        help="Number of runs to average the execution time.",
+    )
+    parser.add_argument(
+        "--nwarmup",
+        type=int,
+        default=20,
+        help="Number of warm-up iterations before benchmarking.",
     )
     parser.add_argument(
         "--dump-kernel",
@@ -334,46 +334,92 @@ def parse_cli():
         action="store_true",
         help="Dump transform schedule.",
     )
+    parser.add_argument(
+        "--json",
+        help="Read problem sizes and tile parameters from a JSON file.",
+    )
     args = parser.parse_args()
 
     return args
 
 
 if __name__ == "__main__":
-    args = parse_cli()
+    description = """XeGPU matrix multiplication example with tunable parameters.
 
-    M, N, K = args.sizes
-
-    params = {
-        "m": M,
-        "n": N,
-        "k": K,
-        "wg_m": None if args.all_knobs else args.wg_tile[0],
-        "wg_n": None if args.all_knobs else args.wg_tile[1],
-        "sg_m": None if args.all_knobs else args.sg_tile[0],
-        "sg_n": None if args.all_knobs else args.sg_tile[1],
-        "k_tile": None if args.all_knobs else args.k_tile,
-        "load_a_m": None if args.all_knobs else args.load_tile_a[0],
-        "load_a_k": None if args.all_knobs else args.load_tile_a[1],
-        "load_b_k": None if args.all_knobs else args.load_tile_b[0],
-        "load_b_n": None if args.all_knobs else args.load_tile_b[1],
-        "prefetch_a_m": None if args.all_knobs else args.prefetch_tile_a[0],
-        "prefetch_a_k": None if args.all_knobs else args.prefetch_tile_a[1],
-        "prefetch_b_k": None if args.all_knobs else args.prefetch_tile_b[0],
-        "prefetch_b_n": None if args.all_knobs else args.prefetch_tile_b[1],
-        "prefetch_nb": args.nb_prefetch,
-    }
+If run without arguments, executes a M=N=K=4096 matrix-multiply-accumulate
+kernel without bias or relu and default tile sizes. The problem size and tile
+sizes can be overridden by providing a JSON file or using the CLI arguments.
+CLI arguments take precedence over everything else. Bias and relu can only be
+enabled via CLI arguments.
+"""
+    args = parse_cli_args(description=description)
 
     ab_type = "f16"
     c_type = "f32"
+
+    # Problem size
+    m, n, k = args.sizes if args.sizes else (4096, 4096, 4096)
+    # Get default parameters from the database
+    try:
+        params = parameter_selector.get_matmul_parameters(m, n, k)
+    except ValueError:
+        # Initialize with a stub and assume the rest will be populated
+        params = {
+            "m": m,
+            "n": n,
+            "k": k,
+            "wg_m": None,
+            "wg_n": None,
+            "sg_m": None,
+            "sg_n": None,
+            "k_tile": None,
+            "load_a_m": None,
+            "load_a_k": None,
+            "load_b_k": None,
+            "load_b_n": None,
+            "prefetch_a_m": None,
+            "prefetch_a_k": None,
+            "prefetch_b_k": None,
+            "prefetch_b_n": None,
+            "prefetch_nb": None,
+        }
+    if args.json:
+        # Override parameters with values from JSON file if provided
+        with open(args.json, "r") as f:
+            json_params = json.load(f)
+        params.update(json_params)
+
+    # Override parameters with CLI args if provided
+    if args.wg_tile:
+        params["wg_m"], params["wg_n"] = args.wg_tile
+    if args.sg_tile:
+        params["sg_m"], params["sg_n"] = args.sg_tile
+    if args.k_tile:
+        params["k_tile"] = args.k_tile
+    if args.load_tile_a:
+        params["load_a_m"], params["load_a_k"] = args.load_tile_a
+    if args.load_tile_b:
+        params["load_b_k"], params["load_b_n"] = args.load_tile_b
+    if args.prefetch_tile_a:
+        params["prefetch_a_m"], params["prefetch_a_k"] = args.prefetch_tile_a
+    if args.prefetch_tile_b:
+        params["prefetch_b_k"], params["prefetch_b_n"] = args.prefetch_tile_b
+    if args.prefetch_nb is not None:
+        params["prefetch_nb"] = args.prefetch_nb
+
+    for k, v in params.items():
+        if v is None:
+            raise ValueError(
+                f"Parameter {k} is not set. Please provide it via CLI or JSON file."
+            )
 
     with ir.Context(), ir.Location.unknown():
         lh_dialects.register_and_load()
 
         wload = XeGPUMatMul(
-            M=M,
-            N=N,
-            K=K,
+            M=params["m"],
+            N=params["n"],
+            K=params["k"],
             ab_type=ab_type,
             c_type=c_type,
             has_bias=args.bias,
@@ -404,17 +450,16 @@ if __name__ == "__main__":
             def list2str(a):
                 return ",".join(map(str, a))
 
-            parts = [
-                f"sizes={list2str(args.sizes)}",
-                f"dt={ab_type},{c_type}",
-                f"wg-tile={list2str(args.wg_tile)}",
-                f"sg-tile={list2str(args.sg_tile)}",
-                f"k-tile={args.k_tile}",
-                f"load-a-tile={list2str(args.load_tile_a)}",
-                f"load-b-tile={list2str(args.load_tile_b)}",
-                f"pf-a-tile={list2str(args.prefetch_tile_a)}",
-                f"pf-b-tile={list2str(args.prefetch_tile_b)}",
-                f"time(us): {elapsed:.2f}",
-                f"GFLOPS: {gflops:.2f}",
-            ]
-            print(" ".join(parts))
+            print(
+                f"sizes={list2str([params['m'], params['n'], params['k']])} "
+                f"dt={ab_type},{c_type} "
+                f"wg-tile={list2str([params['wg_m'], params['wg_n']])} "
+                f"sg-tile={list2str([params['sg_m'], params['sg_n']])} "
+                f"k-tile={params['k_tile']} "
+                f"load-a-tile={list2str([params['load_a_m'], params['load_a_k']])} "
+                f"load-b-tile={list2str([params['load_b_k'], params['load_b_n']])} "
+                f"pf-a-tile={list2str([params['prefetch_a_m'], params['prefetch_a_k']])} "
+                f"pf-b-tile={list2str([params['prefetch_b_k'], params['prefetch_b_n']])} "
+                f"time(us): {elapsed:.2f} "
+                f"GFLOPS: {gflops:.2f}"
+            )
