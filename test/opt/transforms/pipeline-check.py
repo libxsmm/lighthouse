@@ -1,7 +1,7 @@
 from mlir import ir
 from mlir.dialects import transform
 from lighthouse.pipeline.helper import match
-from lighthouse.pipeline.opt import PassBundles, apply_bundle
+from lighthouse.pipeline.stage import PassBundles, apply_bundle
 
 
 def create_schedule(options: dict = {}) -> ir.Module:

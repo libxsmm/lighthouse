@@ -2,11 +2,11 @@ from mlir import ir
 from mlir.dialects import transform
 from mlir.dialects.transform import structured
 
-from .builders import schedule_boilerplate
+from lighthouse.schedule.builders import schedule_boilerplate
 import lighthouse.transform as lh_transform
 
 
-def linalg_contract_fold_unit_dims() -> ir.Module:
+def linalg_contract_fold_unit_dims(options: dict = {}) -> ir.Module:
     """
     Fold unit dims of linalg contract.
 

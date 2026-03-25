@@ -2,7 +2,7 @@
 
 import argparse
 
-from lighthouse.pipeline.opt import Driver
+from lighthouse.pipeline.driver import Driver
 
 
 if __name__ == "__main__":

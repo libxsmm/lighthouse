@@ -1,7 +1,9 @@
 Pipeline:
   - include: bufferization.yaml
   - include: cleanup.yaml
+  - transform: linalg.py[gen=linalg_contract_fold_unit_dims]
   - bundle: MLIRLoweringBundle
   - bundle: CleanupBundle
+  - transform: x86/tile_and_vector_matmul.py
   - bundle: LLVMLoweringBundle
   - pass: canonicalize

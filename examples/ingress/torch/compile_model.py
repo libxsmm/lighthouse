@@ -8,7 +8,7 @@ from mlir import ir
 from mlir.passmanager import PassManager
 
 from lighthouse.ingress.torch import cpu_backend, TargetDialect
-from lighthouse.pipeline.opt import PassBundles, add_bundle
+from lighthouse.pipeline.stage import PassBundles, add_bundle
 
 
 def lower_to_llvm(module: ir.Module) -> ir.Module:
