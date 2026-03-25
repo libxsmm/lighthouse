@@ -11,8 +11,8 @@ XeGPU matrix multiplication example.
 """
 
 import argparse
-import ctypes
 import json
+from dataclasses import dataclass
 from typing import Optional
 from functools import cached_property
 
@@ -22,18 +22,15 @@ from mlir.execution_engine import ExecutionEngine
 
 from lighthouse import dialects as lh_dialects
 from lighthouse.workload import benchmark, get_bench_wrapper_schedule
-from lighthouse.utils.memref import to_ctype as memref_to_ctype
-from lighthouse.utils.numpy import numpy_to_ctype
 from lighthouse.schedule.xegpu.mlp_schedule import get_schedule_module
-from lighthouse.ingress.mlir_gen import (
-    generate_gpu_matmul_payload,
-    get_mlir_elem_type,
-)
+from lighthouse.utils.numpy import mlir_to_numpy_dtype
+from lighthouse.ingress.mlir_gen import generate_gpu_matmul_payload, get_mlir_elem_type
 
 from xegpu_workload import XeGPUWorkload, matmul_complexity
 import parameter_selector
 
 
+@dataclass
 class XeGPUMatMul(XeGPUWorkload):
     """
     Matrix multiplication workload on XeGPU.
@@ -44,38 +41,34 @@ class XeGPUMatMul(XeGPUWorkload):
     Optionally adds a bias term to C (not implemented yet).
     """
 
-    def __init__(
-        self,
-        M: int,
-        N: int,
-        K: int,
-        ab_type: str = "f16",
-        c_type: str = "f32",
-        has_bias: bool = False,
-        has_relu: bool = False,
-        accumulate_c: bool = True,
-    ):
-        super().__init__()
-        self.M = M
-        self.N = N
-        self.K = K
-        self.a_shape = (M, K)
-        self.b_shape = (K, N)
-        self.c_shape = (M, N)
-        self.bias_shape = (N,)
-        assert ab_type == "f16", "Only f16 type is supported for A and B"
-        assert c_type == "f32", "Only f32 type is supported for C"
-        self.ab_type = ab_type
-        self.c_type = c_type
-        type_str_to_numpy = {
-            "f16": np.float16,
-            "f32": np.float32,
-        }
-        self.ab_dtype = type_str_to_numpy[ab_type]
-        self.c_dtype = type_str_to_numpy[c_type]
-        self.has_bias = has_bias
-        self.has_relu = has_relu
-        self.accumulate_c = accumulate_c
+    M: int = 1024
+    N: int = 1024
+    K: int = 1024
+    ab_type: ir.Type | str | None = None
+    c_type: ir.Type | str | None = None
+    has_bias: bool = False
+    has_relu: bool = False
+    accumulate_c: bool = True
+
+    def __post_init__(self):
+        if isinstance(self.ab_type, str):
+            self.ab_type = get_mlir_elem_type(self.ab_type)
+        if isinstance(self.c_type, str):
+            self.c_type = get_mlir_elem_type(self.c_type)
+        if self.ab_type is None:
+            self.ab_type = ir.F16Type.get()
+        if self.c_type is None:
+            self.c_type = ir.F32Type.get()
+        assert isinstance(self.ab_type, ir.F16Type), (
+            "Only f16 type is supported for A and B"
+        )
+        assert isinstance(self.c_type, ir.F32Type), "Only f32 type is supported for C"
+        self.ab_dtype = mlir_to_numpy_dtype(self.ab_type)
+        self.c_dtype = mlir_to_numpy_dtype(self.c_type)
+        self.a_shape = (self.M, self.K)
+        self.b_shape = (self.K, self.N)
+        self.c_shape = (self.M, self.N)
+        self.bias_shape = (self.N,)
 
     @cached_property
     def _initial_host_arrays(self) -> list[np.ndarray]:
@@ -111,46 +104,13 @@ class XeGPUMatMul(XeGPUWorkload):
             C_ref = np.maximum(C_ref, 0)
         return C_ref
 
-    def _get_input_arrays(
-        self, execution_engine: ExecutionEngine
-    ) -> list[ctypes.Structure]:
-        # Allocate device memory for inputs and outputs.
-        A_gpu = self._allocate_array("A", self.a_shape, self.ab_type, execution_engine)
-        B_gpu = self._allocate_array("B", self.b_shape, self.ab_type, execution_engine)
-        C_gpu = self._allocate_array("C", self.c_shape, self.c_type, execution_engine)
-        if self.has_bias:
-            bias_gpu = self._allocate_array(
-                "bias", self.bias_shape, self.c_type, execution_engine
-            )
-
-        # Copy initial values to device.
-        C_host, A_host, B_host, bias_host = self._initial_host_arrays
-        copy_ab, copy_c = ("gpu_copy_2d_" + s for s in (self.ab_type, self.c_type))
-        execution_engine.invoke(copy_ab, numpy_to_ctype(A_host), memref_to_ctype(A_gpu))
-        execution_engine.invoke(copy_ab, numpy_to_ctype(B_host), memref_to_ctype(B_gpu))
-        execution_engine.invoke(copy_c, numpy_to_ctype(C_host), memref_to_ctype(C_gpu))
-        if self.has_bias:
-            copy_bias = "gpu_copy_1d_" + self.c_type
-            execution_engine.invoke(
-                copy_bias, numpy_to_ctype(bias_host), memref_to_ctype(bias_gpu)
-            )
-
-        # Return memrefs for the payload function.
-        if self.has_bias:
-            return [C_gpu, A_gpu, B_gpu, bias_gpu]
-        return [C_gpu, A_gpu, B_gpu]
-
     def check_correctness(
         self, execution_engine: ExecutionEngine, verbose: int = 0
     ) -> bool:
         # Copy result from device to host.
-        C_gpu = self.gpu_memrefs[("C", self.c_type)]
+        C_gpu = self.memory_manager.get("buffer_0")
         C_host_copy = np.zeros((self.M, self.N), dtype=self.c_dtype)
-        execution_engine.invoke(
-            "gpu_copy_2d_" + self.c_type,
-            memref_to_ctype(C_gpu),
-            numpy_to_ctype(C_host_copy),
-        )
+        self.memory_manager.copy(C_gpu, C_host_copy)
 
         C_host_ref = self._reference_solution
         C_host = C_host_copy.astype(np.float32)
@@ -188,11 +148,17 @@ class XeGPUMatMul(XeGPUWorkload):
             M=self.M,
             N=self.N,
             K=self.K,
-            ab_type=get_mlir_elem_type(self.ab_type),
-            c_type=get_mlir_elem_type(self.c_type),
+            ab_type=self.ab_type,
+            c_type=self.c_type,
             has_bias=self.has_bias,
             has_relu=self.has_relu,
             accumulate_c=self.accumulate_c,
+        )
+        ranks_and_types = [(2, self.ab_type), (2, self.c_type)]
+        if self.has_bias:
+            ranks_and_types.append((1, self.c_type))
+        self.memory_manager_class.emit_memory_management_funcs(
+            mod, ranks_and_types=ranks_and_types
         )
         return mod
 
@@ -354,9 +320,6 @@ enabled via CLI arguments.
 """
     args = parse_cli_args(description=description)
 
-    ab_type = "f16"
-    c_type = "f32"
-
     # Problem size
     m, n, k = args.sizes if args.sizes else (4096, 4096, 4096)
     # Get default parameters from the database
@@ -420,8 +383,6 @@ enabled via CLI arguments.
             M=params["m"],
             N=params["n"],
             K=params["k"],
-            ab_type=ab_type,
-            c_type=c_type,
             has_bias=args.bias,
             has_relu=args.relu,
             accumulate_c=not args.no_accumulate_c,
@@ -450,6 +411,8 @@ enabled via CLI arguments.
             def list2str(a):
                 return ",".join(map(str, a))
 
+            ab_type = str(wload.ab_type)
+            c_type = str(wload.c_type)
             print(
                 f"sizes={list2str([params['m'], params['n'], params['k']])} "
                 f"dt={ab_type},{c_type} "
