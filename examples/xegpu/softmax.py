@@ -14,10 +14,10 @@ import numpy as np
 from mlir import ir
 
 from lighthouse import dialects as lh_dialects
+from lighthouse.pipeline.driver import TransformDriver
 from lighthouse.execution import (
     benchmark,
     execute,
-    lower_payload,
     get_bench_wrapper_schedule,
     GPUMemoryManager,
 )
@@ -247,12 +247,12 @@ if __name__ == "__main__":
         wload = XeGPUSoftmax(M=M, N=N, dtype=dtype)
 
         if args.dump_kernel or args.dump_schedule:
-            payload = lower_payload(
-                wload.payload_module(),
+            pipeline = TransformDriver(
                 wload.schedule_modules(
                     stop_at_stage=args.dump_kernel, parameters=params
-                ),
+                )
             )
+            payload = pipeline.apply(wload.payload_module())
             if args.dump_kernel:
                 print(payload)
             if args.dump_schedule:
@@ -272,9 +272,10 @@ if __name__ == "__main__":
                     memory_manager.copy(inputs[0], result_host_copy)
 
                 # Execute kernel once.
+                pipeline = TransformDriver(wload.schedule_modules(parameters=params))
+                payload = pipeline.apply(wload.payload_module())
                 execute(
-                    wload.payload_module(),
-                    schedule_modules=wload.schedule_modules(parameters=params),
+                    payload,
                     host_input_buffers=wload._initial_host_arrays,
                     mem_manager_cls=wload.memory_manager_class,
                     shared_libs=wload.shared_libs(),
@@ -292,8 +293,7 @@ if __name__ == "__main__":
                     raise ValueError("Result mismatch!")
 
             times = benchmark(
-                wload.payload_module(),
-                schedule_modules=wload.schedule_modules(parameters=params),
+                payload,
                 host_input_buffers=wload._initial_host_arrays,
                 mem_manager_cls=wload.memory_manager_class,
                 shared_libs=wload.shared_libs(),

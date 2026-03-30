@@ -21,10 +21,10 @@ import numpy as np
 from mlir import ir
 
 from lighthouse import dialects as lh_dialects
+from lighthouse.pipeline.driver import TransformDriver
 from lighthouse.execution import (
     benchmark,
     execute,
-    lower_payload,
     get_bench_wrapper_schedule,
     MemoryManager,
     GPUMemoryManager,
@@ -462,12 +462,12 @@ enabled via CLI arguments.
         )
 
         if args.dump_kernel or args.dump_schedule:
-            payload = lower_payload(
-                wload.payload_module(),
+            pipeline = TransformDriver(
                 wload.schedule_modules(
                     stop_at_stage=args.dump_kernel, parameters=params
-                ),
+                )
             )
+            payload = pipeline.apply(wload.payload_module())
             if args.dump_kernel:
                 print(payload)
             if args.dump_schedule:
