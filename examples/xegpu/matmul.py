@@ -11,35 +11,70 @@ XeGPU matrix multiplication example.
 """
 
 import argparse
+import ctypes
 import json
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, ClassVar
 from functools import cached_property
 
 import numpy as np
 from mlir import ir
-from mlir.execution_engine import ExecutionEngine
 
 from lighthouse import dialects as lh_dialects
-from lighthouse.workload import benchmark, get_bench_wrapper_schedule
+from lighthouse.execution import (
+    benchmark,
+    execute,
+    lower_payload,
+    get_bench_wrapper_schedule,
+    MemoryManager,
+    GPUMemoryManager,
+)
 from lighthouse.schedule.xegpu.mlp_schedule import get_schedule_module
 from lighthouse.utils.numpy import mlir_to_numpy_dtype
 from lighthouse.ingress.mlir_gen import generate_gpu_matmul_payload, get_mlir_elem_type
 
-from xegpu_workload import XeGPUWorkload, matmul_complexity
 import parameter_selector
 
 
+def matmul_complexity(
+    M: int,
+    N: int,
+    K: int,
+    bias: bool,
+    relu: bool,
+    accumulate_c: bool,
+    nbytes_ab: int,
+    nbytes_c: int,
+):
+    """Complexity of matmul operation with optional post-ops"""
+    flop_count = 2 * M * N * K
+    memory_reads = (M * K + K * N) * nbytes_ab  # read A and B
+    memory_writes = M * N * nbytes_c  # write C
+    # Below we assume the post-ops are tiled-and-fused and do not cause
+    # reads/writes to global memory.
+    if bias:
+        flop_count += M * N
+        memory_reads += N * nbytes_c  # read bias vector
+    if relu:
+        flop_count += M * N
+    if accumulate_c:
+        memory_reads += M * N * nbytes_c  # read C for accumulation
+    return flop_count, memory_reads, memory_writes
+
+
 @dataclass
-class XeGPUMatMul(XeGPUWorkload):
+class XeGPUMatMul:
     """
-    Matrix multiplication workload on XeGPU.
+    Matrix multiplication kernel on XeGPU.
 
     Computes C = A * B for input matrices A (M x K) and B (K x N).
 
     Optionally adds a ReLU operation on the result C.
     Optionally adds a bias term to C (not implemented yet).
     """
+
+    payload_function_name: ClassVar[str] = "payload"
+    memory_manager_class: ClassVar[type[MemoryManager]] = GPUMemoryManager
 
     M: int = 1024
     N: int = 1024
@@ -84,49 +119,10 @@ class XeGPUMatMul(XeGPUWorkload):
         A = gen_random(self.a_shape, self.ab_dtype)
         B = gen_random(self.b_shape, self.ab_dtype)
         C = gen_random(self.c_shape, self.c_dtype)
-        bias = None
         if self.has_bias:
             bias = gen_random(self.bias_shape, self.c_dtype)
-        return C, A, B, bias
-
-    @cached_property
-    def _reference_solution(self) -> np.ndarray:
-        """Compute reference solution on host with numpy."""
-        C, A, B, bias = self._initial_host_arrays
-        # use float32 data type for efficiency
-        f32 = np.float32
-        C_ref = A.astype(f32) @ B.astype(f32)
-        if self.accumulate_c:
-            C_ref += C.astype(f32)
-        if self.has_bias:
-            C_ref += bias.astype(f32)
-        if self.has_relu:
-            C_ref = np.maximum(C_ref, 0)
-        return C_ref
-
-    def check_correctness(
-        self, execution_engine: ExecutionEngine, verbose: int = 0
-    ) -> bool:
-        # Copy result from device to host.
-        C_gpu = self.memory_manager.get("buffer_0")
-        C_host_copy = np.zeros((self.M, self.N), dtype=self.c_dtype)
-        self.memory_manager.copy(C_gpu, C_host_copy)
-
-        C_host_ref = self._reference_solution
-        C_host = C_host_copy.astype(np.float32)
-        if verbose > 1:
-            print("Reference solution:")
-            print(C_host_ref)
-            print("Computed solution:")
-            print(C_host)
-        success = np.allclose(C_host, C_host_ref)
-
-        if verbose:
-            if success:
-                print("PASSED")
-            else:
-                print("FAILED Result mismatch!")
-        return success
+            return C, A, B, bias
+        return C, A, B
 
     def get_complexity(self) -> tuple[int, int, int]:
         nbytes_ab = np.dtype(self.ab_dtype).itemsize
@@ -167,7 +163,7 @@ class XeGPUMatMul(XeGPUWorkload):
     ) -> list[ir.Module]:
         assert parameters is not None, "Schedule parameters must be provided"
         return [
-            get_bench_wrapper_schedule(self),
+            get_bench_wrapper_schedule(self.payload_function_name),
             get_schedule_module(
                 has_bias=self.has_bias,
                 has_relu=self.has_relu,
@@ -179,6 +175,76 @@ class XeGPUMatMul(XeGPUWorkload):
 
     def shared_libs(self) -> list[str]:
         return ["libmlir_levelzero_runtime.so"]
+
+
+def execute_and_check(mmul: XeGPUMatMul, params: dict, verbose: int = 0) -> bool:
+    """Execute the matmul kernel and check correctness of the result."""
+
+    # Setup callback function to copy result from device to host.
+    D_host_copy = np.zeros((mmul.M, mmul.N), dtype=mmul.c_dtype)
+
+    def callback(
+        inputs: list[ctypes.Structure], *, memory_manager: GPUMemoryManager, **kwargs
+    ):
+        memory_manager.copy(inputs[0], D_host_copy)
+
+    # Execute kernel once.
+    execute(
+        mmul.payload_module(),
+        schedule_modules=mmul.schedule_modules(parameters=params),
+        host_input_buffers=mmul._initial_host_arrays,
+        mem_manager_cls=mmul.memory_manager_class,
+        shared_libs=mmul.shared_libs(),
+        payload_function_name=mmul.payload_function_name,
+        callback=callback,
+    )
+
+    # Compute reference solution on host.
+    host_inputs = mmul._initial_host_arrays
+    C, A, B = host_inputs[:3]
+    bias = host_inputs[3] if mmul.has_bias else None
+
+    # use float32 data type for efficiency
+    f32 = np.float32
+    D_ref = A.astype(f32) @ B.astype(f32)
+    if mmul.accumulate_c:
+        D_ref += C.astype(f32)
+    if mmul.has_bias:
+        D_ref += bias.astype(f32)
+    if mmul.has_relu:
+        D_ref = np.maximum(D_ref, 0)
+
+    D_host = D_host_copy.astype(np.float32)
+    if verbose > 1:
+        print("Reference solution:")
+        print(D_ref)
+        print("Computed solution:")
+        print(D_host)
+    success = np.allclose(D_host, D_ref)
+
+    if verbose:
+        if success:
+            print("PASSED")
+        else:
+            print("FAILED Result mismatch!")
+
+    return success
+
+
+def run_benchmark(
+    mmul: XeGPUMatMul, params: dict, nruns: int = 100, nwarmup: int = 10
+) -> np.ndarray:
+    """Benchmark the matmul kernel and return array of execution times in seconds."""
+    times = benchmark(
+        mmul.payload_module(),
+        schedule_modules=mmul.schedule_modules(parameters=params),
+        host_input_buffers=mmul._initial_host_arrays,
+        mem_manager_cls=mmul.memory_manager_class,
+        shared_libs=mmul.shared_libs(),
+        nruns=nruns,
+        nwarmup=nwarmup,
+    )
+    return times
 
 
 def cli_parser(description):
@@ -304,6 +370,13 @@ def parse_cli_args(description):
         "--json",
         help="Read problem sizes and tile parameters from a JSON file.",
     )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="count",
+        default=0,
+        help="Increase output verbosity (e.g. print reference and computed solutions).",
+    )
     args = parser.parse_args()
 
     return args
@@ -389,20 +462,24 @@ enabled via CLI arguments.
         )
 
         if args.dump_kernel or args.dump_schedule:
-            wload.lower_payload(
-                dump_payload=args.dump_kernel,
-                dump_schedule=args.dump_schedule,
-                schedule_parameters=params,
+            payload = lower_payload(
+                wload.payload_module(),
+                wload.schedule_modules(
+                    stop_at_stage=args.dump_kernel, parameters=params
+                ),
             )
+            if args.dump_kernel:
+                print(payload)
+            if args.dump_schedule:
+                for schedule_module in wload.schedule_modules():
+                    print(schedule_module)
         else:
-            times = benchmark(
-                wload,
-                nruns=args.nruns,
-                nwarmup=args.nwarmup,
-                schedule_parameters=params,
-                check_correctness=args.check_result,
-                verbose=1,
-            )
+            if args.check_result:
+                success = execute_and_check(wload, params, args.verbose)
+                if not success:
+                    raise ValueError("Result mismatch!")
+
+            times = run_benchmark(wload, params, nruns=args.nruns, nwarmup=args.nwarmup)
             times *= 1e6  # convert to microseconds
             elapsed = np.mean(times)
             flop_count = wload.get_complexity()[0]

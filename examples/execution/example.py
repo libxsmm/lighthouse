@@ -3,11 +3,10 @@
 # CHECK: PASSED
 # CHECK: Throughput:
 """
-Workload example: Element-wise sum of two (M, N) float32 arrays on CPU.
+Kernel execution example: Element-wise sum of two (M, N) float32 arrays on CPU.
 """
 
 import ctypes
-from contextlib import contextmanager
 from functools import cached_property
 from typing import Optional
 
@@ -16,15 +15,19 @@ from mlir import ir
 from mlir.runtime.np_to_memref import get_ranked_memref_descriptor
 from mlir.dialects import func, linalg, bufferization
 from mlir.dialects import transform
-from mlir.execution_engine import ExecutionEngine
 
 from lighthouse import dialects as lh_dialects
 from lighthouse.pipeline.helper import match
 from lighthouse.pipeline.stage import PassBundles, apply_bundle
-from lighthouse.workload import Workload, execute, benchmark, get_bench_wrapper_schedule
+from lighthouse.execution import (
+    execute,
+    benchmark,
+    lower_payload,
+    get_bench_wrapper_schedule,
+)
 
 
-class ElementwiseSum(Workload):
+class ElementwiseSum:
     """
     Computes element-wise sum of (M, N) float32 arrays on CPU.
 
@@ -34,6 +37,8 @@ class ElementwiseSum(Workload):
     We use @cached_property to store the inputs and reference solution in the
     object so that they are only computed once.
     """
+
+    payload_function_name: str = "payload"
 
     def __init__(self, M: int, N: int):
         self.M = M
@@ -49,40 +54,8 @@ class ElementwiseSum(Workload):
         C = np.zeros((self.M, self.N), dtype=self.dtype)
         return [A, B, C]
 
-    @cached_property
-    def _reference_solution(self) -> np.ndarray:
-        print(" * Computing reference solution...")
-        A, B, _ = self._input_arrays
-        return A + B
-
     def _get_input_arrays(self) -> list[ctypes.Structure]:
         return [get_ranked_memref_descriptor(a) for a in self._input_arrays]
-
-    @contextmanager
-    def allocate_inputs(self, execution_engine: ExecutionEngine):
-        try:
-            yield self._get_input_arrays()
-        finally:
-            # cached numpy arrays are deallocated automatically
-            pass
-
-    def check_correctness(
-        self, execution_engine: ExecutionEngine, verbose: int = 0
-    ) -> bool:
-        C = self._input_arrays[2]
-        C_ref = self._reference_solution
-        if verbose > 1:
-            print("Reference solution:")
-            print(C_ref)
-            print("Computed solution:")
-            print(C)
-        success = np.allclose(C, C_ref)
-        if verbose:
-            if success:
-                print("PASSED")
-            else:
-                print("FAILED Result mismatch!")
-        return success
 
     def shared_libs(self) -> list[str]:
         return []
@@ -154,7 +127,10 @@ class ElementwiseSum(Workload):
                 mod = apply_bundle(mod, PassBundles["LLVMLoweringBundle"])
                 transform.YieldOp()
 
-        return [get_bench_wrapper_schedule(self), schedule_module]
+        return [
+            get_bench_wrapper_schedule(self.payload_function_name),
+            schedule_module,
+        ]
 
 
 if __name__ == "__main__":
@@ -164,16 +140,52 @@ if __name__ == "__main__":
         wload = ElementwiseSum(400, 400)
 
         print(" Dump kernel ".center(60, "-"))
-        wload.lower_payload(dump_payload="bufferized", dump_schedule=True)
+        payload = lower_payload(
+            wload.payload_module(),
+            wload.schedule_modules(stop_at_stage="bufferized"),
+        )
+        print(payload)
+        for schedule_module in wload.schedule_modules():
+            print(schedule_module)
 
         print(" Execute 1 ".center(60, "-"))
-        execute(wload, verbose=2)
+        execute(
+            wload.payload_module(),
+            schedule_modules=wload.schedule_modules(),
+            host_input_buffers=wload._input_arrays,
+            shared_libs=wload.shared_libs(),
+            payload_function_name=wload.payload_function_name,
+        )
 
         print(" Execute 2 ".center(60, "-"))
-        execute(wload, verbose=1)
+        execute(
+            wload.payload_module(),
+            schedule_modules=wload.schedule_modules(),
+            host_input_buffers=wload._input_arrays,
+            shared_libs=wload.shared_libs(),
+            payload_function_name=wload.payload_function_name,
+        )
+
+        print(" Correctness test ".center(60, "-"))
+        A, B, C = wload._input_arrays
+        C_ref = A + B
+        print("Reference solution:")
+        print(C_ref)
+        print("Computed solution:")
+        print(C)
+        success = np.allclose(C, C_ref)
+        if success:
+            print("PASSED")
+        else:
+            print("FAILED Result mismatch!")
 
         print(" Benchmark ".center(60, "-"))
-        times = benchmark(wload)
+        times = benchmark(
+            wload.payload_module(),
+            schedule_modules=wload.schedule_modules(),
+            host_input_buffers=wload._input_arrays,
+            shared_libs=wload.shared_libs(),
+        )
         times *= 1e6  # convert to microseconds
         # compute statistics
         mean = np.mean(times)

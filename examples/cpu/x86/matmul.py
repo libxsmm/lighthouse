@@ -14,17 +14,20 @@ import ctypes
 import argparse
 import sys
 import warnings
-from contextlib import contextmanager
 
 import ml_dtypes
 import numpy as np
 from mlir import ir
 from mlir.dialects import linalg, transform
-from mlir.execution_engine import ExecutionEngine
 from mlir.dialects.transform import tensor
 
 from lighthouse import dialects as lh_dialects
-from lighthouse.workload import benchmark, get_bench_wrapper_schedule
+from lighthouse.execution import (
+    benchmark,
+    execute,
+    lower_payload,
+    get_bench_wrapper_schedule,
+)
 from lighthouse.utils.numpy import numpy_to_mlir_type
 from lighthouse.pipeline.helper import apply_registered_pass
 import lighthouse.utils as lh_utils
@@ -38,13 +41,13 @@ from typing import Optional
 from mlir.runtime.np_to_memref import get_ranked_memref_descriptor
 from mlir.dialects import bufferization
 
-from lighthouse.workload import Workload
 
-
-class Matmul(Workload):
+class Matmul:
     """
     Computes GEMM: C = A * B on CPU.
     """
+
+    payload_function_name: str = "payload"
 
     def __init__(self, M: int, N: int, K: int, dtype=np.float32, tile_size: int = 32):
         if dtype not in [np.float32, ml_dtypes.bfloat16]:
@@ -65,13 +68,6 @@ class Matmul(Workload):
         self.dtype = dtype
         self.tile_size = tile_size
 
-    def check_correctness(
-        self, execution_engine: ExecutionEngine, verbose: int = 0
-    ) -> bool:
-        A, B, C = self._input_arrays
-        out_ref = np.matmul(A, B, dtype=np.float32)
-        return np.allclose(C, out_ref)
-
     @cached_property
     def _input_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         np.random.seed(123)
@@ -82,14 +78,6 @@ class Matmul(Workload):
 
     def _get_input_arrays(self) -> list[ctypes.Structure]:
         return [get_ranked_memref_descriptor(a) for a in self._input_arrays]
-
-    @contextmanager
-    def allocate_inputs(self, execution_engine: ExecutionEngine):
-        try:
-            yield self._get_input_arrays()
-        finally:
-            # cached numpy arrays are deallocated automatically
-            pass
 
     def shared_libs(self) -> list[str]:
         return []
@@ -142,7 +130,10 @@ class Matmul(Workload):
         scheds = []
 
         # Insert performance measurements.
-        scheds.append(get_bench_wrapper_schedule(self))
+        scheds.append(get_bench_wrapper_schedule(self.payload_function_name))
+
+        if stop_at_stage == "initial":
+            return scheds
 
         # GEMM block packing.
         # Create cache-friendly access pattern across matmul tiles.
@@ -368,15 +359,43 @@ if __name__ == "__main__":
         wload = Matmul(*args.sizes, dtype=in_dtype, tile_size=args.tile_size)
 
         if args.dump_kernel or args.dump_schedule:
-            wload.lower_payload(
-                dump_payload=args.dump_kernel,
-                dump_schedule=args.dump_schedule,
+            payload = lower_payload(
+                wload.payload_module(),
+                wload.schedule_modules(stop_at_stage=args.dump_kernel),
             )
+            if args.dump_kernel:
+                print(payload)
+            if args.dump_schedule:
+                for schedule_module in wload.schedule_modules():
+                    print(schedule_module)
             sys.exit(0)
 
-        times = benchmark(
-            wload, check_correctness=True, nruns=args.nruns, nwarmup=args.nwarmup
+        # check correctness
+        execute(
+            wload.payload_module(),
+            schedule_modules=wload.schedule_modules(),
+            host_input_buffers=wload._input_arrays,
+            shared_libs=wload.shared_libs(),
+            payload_function_name=wload.payload_function_name,
         )
+
+        A, B, C = wload._input_arrays
+        C_ref = np.matmul(A, B, dtype=np.float32)
+        success = np.allclose(C, C_ref)
+        if not success:
+            print("FAILED Result mismatch.")
+            sys.exit(1)
+
+        times = benchmark(
+            wload.payload_module(),
+            schedule_modules=wload.schedule_modules(),
+            host_input_buffers=wload._input_arrays,
+            shared_libs=wload.shared_libs(),
+            payload_function_name=wload.benchmark_function_name,
+            nruns=args.nruns,
+            nwarmup=args.nwarmup,
+        )
+
         times *= 1e6  # convert to microseconds
 
         print(f"MxNxK: {args.sizes}")
