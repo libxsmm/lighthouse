@@ -11,7 +11,10 @@ from lighthouse.pipeline.helper import (
     apply_registered_pass,
     canonicalize,
     match,
+    match_and_split,
+    PipelineInterrupt,
 )
+from lighthouse.schedule.xegpu.helper import bundle_xegpu_to_binary
 
 from lighthouse.dialects import smt_ext, transform_smt_ext as td_smt_ext
 from lighthouse.dialects.transform_tune_ext import knob, KnobValue
@@ -31,22 +34,6 @@ PFETCH_MAX_COLS = 32
 MAX_NB_SG_THREADS = 64
 # heuristics: skip likely suboptimal configurations
 MIN_NB_THREADS = 16
-
-
-class PipelineInterrupt(Exception):
-    """Exception to signal early termination of the transform schedule."""
-
-    pass
-
-
-def match_and_split(*args, nhandles=1, **kwargs):
-    """Helper function that splits matched handles."""
-    matched = match(*args, **kwargs)
-    anytype = transform.AnyOpType.get()
-    matched_ops = transform.split_handle((anytype,) * nhandles, matched)
-    if nhandles == 1:
-        matched_ops = [matched_ops]
-    return matched_ops
 
 
 @KnobValue.ast_rewrite(in_exprs=True)
@@ -614,15 +601,3 @@ def xegpu_wg_annotation_for_mlp_layer(
 
     canonicalize(gpu_func)
     transform.apply_cse(gpu_func)
-
-
-def bundle_xegpu_to_binary(
-    mod: ir.Value, stop_at_stage: str = ""
-) -> ir.Value[transform.AnyOpType]:
-    """Schedule for lowering xegpu wg level to binary."""
-    # upstream xegpu/xevm pipeline is payload independent.
-    mod = apply_registered_pass(
-        mod, "gpu-lower-to-xevm-pipeline", options={"xegpu-op-level": "workgroup"}
-    )
-
-    return mod

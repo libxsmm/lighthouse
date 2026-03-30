@@ -98,3 +98,19 @@ def cleanup_func(target):
     func = structured.MatchOp.match_op_names(target, ["func.func"]).result
     transform.apply_cse(func)
     canonicalize(func)
+
+
+class PipelineInterrupt(Exception):
+    """Exception to signal early termination of the transform schedule."""
+
+    pass
+
+
+def match_and_split(*args, nhandles=1, **kwargs):
+    """Helper function that splits matched handles."""
+    matched = match(*args, **kwargs)
+    anytype = transform.AnyOpType.get()
+    matched_ops = transform.split_handle((anytype,) * nhandles, matched)
+    if nhandles == 1:
+        matched_ops = [matched_ops]
+    return matched_ops
