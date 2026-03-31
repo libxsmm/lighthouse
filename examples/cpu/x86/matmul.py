@@ -1,4 +1,5 @@
 # RUN: %PYTHON %s --dump-kernel=vectorized | FileCheck %s
+# RUN: %PYTHON %s --dump-kernel=vectorized --tile-size=64 | FileCheck %s
 # RUN: %PYTHON %s --dump-kernel=vectorized --dtype=bf16 --avx512 | FileCheck %s --check-prefix=AVX512
 
 # CHECK: vector.broadcast
@@ -34,6 +35,7 @@ import lighthouse.utils as lh_utils
 from lighthouse import schedule as lh_schedule
 import lighthouse.schedule.x86 as lh_schedule_x86
 from lighthouse import transform as lh_transform
+import lighthouse.transform.x86 as lh_transform_x86
 import lighthouse.ingress.mlir_gen.utils as lh_mlir_utils
 from functools import cached_property
 from typing import Optional
@@ -165,9 +167,15 @@ class Matmul:
         # GEMM cache tiling.
         # Create memory friendly access pattern.
         gemm_op = "linalg.contract"
-        scheds.append(
-            lh_schedule.tile_ops(gemm_op, tile_sizes=[1, 1], fuse_producers=True)
-        )
+        with lh_schedule.schedule_boilerplate() as (sched, named_seq):
+            ops = lh_transform.match_op(named_seq.bodyTarget, gemm_op)
+            with lh_transform.foreach(ops) as op:
+                lh_transform_x86.matmul_cache_tiling(
+                    op, num_tiles=6, tile_size=self.tile_size, fuse_producers=True
+                )
+                transform.yield_()
+            transform.yield_()
+        scheds.append(sched)
 
         # Fold extra parallel outer unit dims before further tiling to help later
         # vectorization rewrites to recognize ops.
@@ -359,12 +367,12 @@ if __name__ == "__main__":
             sys.exit(1)
 
         wload = Matmul(*args.sizes, dtype=in_dtype, tile_size=args.tile_size)
+        pipeline = TransformDriver(
+            wload.schedule_modules(stop_at_stage=args.dump_kernel)
+        )
+        payload = pipeline.apply(wload.payload_module())
 
         if args.dump_kernel or args.dump_schedule:
-            pipeline = TransformDriver(
-                wload.schedule_modules(stop_at_stage=args.dump_kernel)
-            )
-            payload = pipeline.apply(wload.payload_module())
             if args.dump_kernel:
                 print(payload)
             if args.dump_schedule:
@@ -374,8 +382,7 @@ if __name__ == "__main__":
 
         # check correctness
         execute(
-            wload.payload_module(),
-            schedule_modules=wload.schedule_modules(),
+            payload,
             host_input_buffers=wload._input_arrays,
             shared_libs=wload.shared_libs(),
             payload_function_name=wload.payload_function_name,
@@ -389,11 +396,9 @@ if __name__ == "__main__":
             sys.exit(1)
 
         times = benchmark(
-            wload.payload_module(),
-            schedule_modules=wload.schedule_modules(),
+            payload,
             host_input_buffers=wload._input_arrays,
             shared_libs=wload.shared_libs(),
-            payload_function_name=wload.benchmark_function_name,
             nruns=args.nruns,
             nwarmup=args.nwarmup,
         )
