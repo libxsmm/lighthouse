@@ -13,10 +13,11 @@ from csv_logger import CSVLogger
 from mlir import ir
 
 from lighthouse import dialects as lh_dialects
+from lighthouse.execution.runner import Runner
 from lighthouse.schedule.xegpu.mlp_schedule import DPAS
 from lighthouse.pipeline.driver import TransformDriver
 
-from matmul import XeGPUMatMul, run_benchmark, execute_and_check, cli_parser
+from matmul import XeGPUMatMul, check_results, cli_parser
 from genetic_algorithm import (
     Variable,
     VariableSet,
@@ -51,13 +52,31 @@ def run_experiment(
         pipeline = TransformDriver(wload.schedule_modules(parameters=params))
         payload = pipeline.apply(wload.payload_module())
 
+        runner = Runner(
+            payload,
+            mem_manager_cls=wload.memory_manager_class,
+            shared_libs=wload.shared_libs(),
+        )
         if check_result:
-            success = execute_and_check(wload, payload, verbose=1)
+            # Setup callback function to copy result from device to host.
+            D_host_copy, argument_access_callback = (
+                Runner.get_gpu_argument_access_callback(wload.c_shape, wload.c_dtype)
+            )
+            runner.execute(
+                host_input_buffers=wload._initial_host_arrays,
+                payload_function_name=wload.payload_function_name,
+                argument_access_callback=argument_access_callback,
+            )
+            success = check_results(wload, payload, [D_host_copy], verbose=1)
             if not success:
                 raise ValueError("Result mismatch!")
         if nruns is None and nwarmup is None:
             # first run to estimate cost
-            times = run_benchmark(wload, payload, nruns=10, nwarmup=10)
+            times = runner.benchmark(
+                host_input_buffers=wload._initial_host_arrays,
+                nruns=10,
+                nwarmup=10,
+            )
             # estimate number of runs
             cost = times.mean()
             warmup_target = 0.25
@@ -65,7 +84,11 @@ def run_experiment(
             nruns = 3 * nwarmup
             print(f"{nwarmup=} {nruns=}")
         # benchmark
-        times = run_benchmark(wload, payload, nruns=nruns, nwarmup=nwarmup)
+        times = runner.benchmark(
+            host_input_buffers=wload._initial_host_arrays,
+            nruns=nruns,
+            nwarmup=nwarmup,
+        )
 
     times *= 1e6  # convert to microseconds
     elapsed = np.mean(times)

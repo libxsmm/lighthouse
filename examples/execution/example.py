@@ -17,14 +17,10 @@ from mlir.dialects import func, linalg, bufferization
 from mlir.dialects import transform
 
 from lighthouse import dialects as lh_dialects
+from lighthouse.execution.runner import Runner
 from lighthouse.pipeline.helper import match
 from lighthouse.pipeline.stage import PassBundles, apply_bundle
 from lighthouse.pipeline.driver import TransformDriver
-from lighthouse.execution import (
-    execute,
-    benchmark,
-    get_bench_wrapper_schedule,
-)
 
 
 class ElementwiseSum:
@@ -128,7 +124,7 @@ class ElementwiseSum:
                 transform.YieldOp()
 
         return [
-            get_bench_wrapper_schedule(self.payload_function_name),
+            Runner.get_bench_wrapper_schedule(self.payload_function_name),
             schedule_module,
         ]
 
@@ -148,20 +144,17 @@ if __name__ == "__main__":
 
         pipeline = TransformDriver(wload.schedule_modules())
         payload = pipeline.apply(wload.payload_module())
+        runner = Runner(payload, shared_libs=wload.shared_libs())
 
         print(" Execute 1 ".center(60, "-"))
-        execute(
-            payload,
+        runner.execute(
             host_input_buffers=wload._input_arrays,
-            shared_libs=wload.shared_libs(),
             payload_function_name=wload.payload_function_name,
         )
 
         print(" Execute 2 ".center(60, "-"))
-        execute(
-            payload,
+        runner.execute(
             host_input_buffers=wload._input_arrays,
-            shared_libs=wload.shared_libs(),
             payload_function_name=wload.payload_function_name,
         )
 
@@ -179,10 +172,8 @@ if __name__ == "__main__":
             print("FAILED Result mismatch!")
 
         print(" Benchmark ".center(60, "-"))
-        times = benchmark(
-            payload,
+        times = runner.benchmark(
             host_input_buffers=wload._input_arrays,
-            shared_libs=wload.shared_libs(),
         )
         times *= 1e6  # convert to microseconds
         # compute statistics

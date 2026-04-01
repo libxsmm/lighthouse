@@ -23,12 +23,8 @@ from mlir.dialects import linalg, transform
 from mlir.dialects.transform import tensor
 
 from lighthouse import dialects as lh_dialects
+from lighthouse.execution.runner import Runner
 from lighthouse.pipeline.driver import TransformDriver
-from lighthouse.execution import (
-    benchmark,
-    execute,
-    get_bench_wrapper_schedule,
-)
 from lighthouse.utils.numpy import numpy_to_mlir_type
 from lighthouse.pipeline.helper import apply_registered_pass
 import lighthouse.utils as lh_utils
@@ -132,7 +128,7 @@ class Matmul:
         scheds = []
 
         # Insert performance measurements.
-        scheds.append(get_bench_wrapper_schedule(self.payload_function_name))
+        scheds.append(Runner.get_bench_wrapper_schedule(self.payload_function_name))
 
         if stop_at_stage == "initial":
             return scheds
@@ -380,14 +376,14 @@ if __name__ == "__main__":
                     print(schedule_module)
             sys.exit(0)
 
-        # check correctness
-        execute(
-            payload,
+        # First, execution for correctness
+        runner = Runner(payload, shared_libs=wload.shared_libs())
+        runner.execute(
             host_input_buffers=wload._input_arrays,
-            shared_libs=wload.shared_libs(),
             payload_function_name=wload.payload_function_name,
         )
 
+        # check correctness
         A, B, C = wload._input_arrays
         C_ref = np.matmul(A, B, dtype=np.float32)
         success = np.allclose(C, C_ref)
@@ -395,10 +391,9 @@ if __name__ == "__main__":
             print("FAILED Result mismatch.")
             sys.exit(1)
 
-        times = benchmark(
-            payload,
+        # Now, benchmark
+        times = runner.benchmark(
             host_input_buffers=wload._input_arrays,
-            shared_libs=wload.shared_libs(),
             nruns=args.nruns,
             nwarmup=args.nwarmup,
         )

@@ -16,7 +16,6 @@ lowered and executed.
 
 import argparse
 from dataclasses import dataclass
-import ctypes
 from typing import Optional, ClassVar
 from functools import cached_property
 import warnings
@@ -25,11 +24,9 @@ import numpy as np
 from mlir import ir
 
 from lighthouse import dialects as lh_dialects
+from lighthouse.execution.runner import Runner
 from lighthouse.pipeline.driver import TransformDriver
 from lighthouse.execution import (
-    benchmark,
-    execute,
-    get_bench_wrapper_schedule,
     MemoryManager,
     GPUMemoryManager,
 )
@@ -228,7 +225,7 @@ class XeGPUMLP:
         self, stop_at_stage: Optional[str] = None, parameters: Optional[dict] = None
     ) -> list[ir.Module]:
         return [
-            get_bench_wrapper_schedule(self.payload_function_name),
+            Runner.get_bench_wrapper_schedule(self.payload_function_name),
             get_schedule_module(
                 has_bias=self.has_bias,
                 has_relu=self.has_relu,
@@ -386,24 +383,22 @@ if __name__ == "__main__":
         else:
             pipeline = TransformDriver(wload.schedule_modules(parameters=params))
             payload = pipeline.apply(wload.payload_module())
+            runner = Runner(
+                payload,
+                mem_manager_cls=wload.memory_manager_class,
+                shared_libs=wload.shared_libs(),
+            )
             if args.check_result:
                 # Setup callback function to copy result from device to host.
-                result_host_copy = np.zeros(wload.output_shape, dtype=wload.ab_dtype)
-
-                def argument_access_callback(
-                    inputs: list[ctypes.Structure],
-                    *,
-                    memory_manager: GPUMemoryManager,
-                    **kwargs,
-                ):
-                    memory_manager.copy(inputs[0], result_host_copy)
+                result_host_copy, argument_access_callback = (
+                    Runner.get_gpu_argument_access_callback(
+                        wload.output_shape, wload.ab_dtype
+                    )
+                )
 
                 # Execute kernel once.
-                execute(
-                    payload,
+                runner.execute(
                     host_input_buffers=wload._initial_host_arrays,
-                    mem_manager_cls=wload.memory_manager_class,
-                    shared_libs=wload.shared_libs(),
                     payload_function_name=wload.payload_function_name,
                     argument_access_callback=argument_access_callback,
                 )
@@ -420,11 +415,8 @@ if __name__ == "__main__":
                 if not success:
                     raise ValueError("Result mismatch!")
 
-            times = benchmark(
-                payload,
+            times = runner.benchmark(
                 host_input_buffers=wload._initial_host_arrays,
-                mem_manager_cls=wload.memory_manager_class,
-                shared_libs=wload.shared_libs(),
                 nruns=args.nruns,
                 nwarmup=args.nwarmup,
                 argument_access_callback=None,

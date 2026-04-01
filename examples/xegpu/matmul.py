@@ -11,7 +11,6 @@ XeGPU matrix multiplication example.
 """
 
 import argparse
-import ctypes
 import json
 from dataclasses import dataclass
 from typing import Optional, ClassVar
@@ -21,11 +20,9 @@ import numpy as np
 from mlir import ir
 
 from lighthouse import dialects as lh_dialects
+from lighthouse.execution.runner import Runner
 from lighthouse.pipeline.driver import TransformDriver
 from lighthouse.execution import (
-    benchmark,
-    execute,
-    get_bench_wrapper_schedule,
     MemoryManager,
     GPUMemoryManager,
 )
@@ -163,7 +160,7 @@ class XeGPUMatMul:
     ) -> list[ir.Module]:
         assert parameters is not None, "Schedule parameters must be provided"
         return [
-            get_bench_wrapper_schedule(self.payload_function_name),
+            Runner.get_bench_wrapper_schedule(self.payload_function_name),
             get_schedule_module(
                 has_bias=self.has_bias,
                 has_relu=self.has_relu,
@@ -177,27 +174,12 @@ class XeGPUMatMul:
         return ["libmlir_levelzero_runtime.so"]
 
 
-def execute_and_check(mmul: XeGPUMatMul, payload: ir.Module, verbose: int = 0) -> bool:
-    """Execute the matmul kernel and check correctness of the result."""
-
-    # Setup callback function to copy result from device to host.
-    D_host_copy = np.zeros((mmul.M, mmul.N), dtype=mmul.c_dtype)
-
-    def argument_access_callback(
-        inputs: list[ctypes.Structure], *, memory_manager: GPUMemoryManager, **kwargs
-    ):
-        memory_manager.copy(inputs[0], D_host_copy)
-
-    # Execute kernel once.
-    execute(
-        payload,
-        host_input_buffers=mmul._initial_host_arrays,
-        mem_manager_cls=mmul.memory_manager_class,
-        shared_libs=mmul.shared_libs(),
-        payload_function_name=mmul.payload_function_name,
-        argument_access_callback=argument_access_callback,
-    )
-
+def check_results(
+    mmul: XeGPUMatMul, payload: ir.Module, buffers: list[np.ndarray], verbose: int = 0
+) -> bool:
+    """
+    Check correctness of the result.
+    """
     # Compute reference solution on host.
     host_inputs = mmul._initial_host_arrays
     C, A, B = host_inputs[:3]
@@ -213,7 +195,7 @@ def execute_and_check(mmul: XeGPUMatMul, payload: ir.Module, verbose: int = 0) -
     if mmul.has_relu:
         D_ref = np.maximum(D_ref, 0)
 
-    D_host = D_host_copy.astype(np.float32)
+    D_host = buffers[0].astype(np.float32)
     if verbose > 1:
         print("Reference solution:")
         print(D_ref)
@@ -228,21 +210,6 @@ def execute_and_check(mmul: XeGPUMatMul, payload: ir.Module, verbose: int = 0) -
             print("FAILED Result mismatch!")
 
     return success
-
-
-def run_benchmark(
-    mmul: XeGPUMatMul, payload_module: ir.Module, nruns: int = 100, nwarmup: int = 10
-) -> np.ndarray:
-    """Benchmark the matmul kernel and return array of execution times in seconds."""
-    times = benchmark(
-        payload_module,
-        host_input_buffers=mmul._initial_host_arrays,
-        mem_manager_cls=mmul.memory_manager_class,
-        shared_libs=mmul.shared_libs(),
-        nruns=nruns,
-        nwarmup=nwarmup,
-    )
-    return times
 
 
 def cli_parser(description):
@@ -474,13 +441,31 @@ enabled via CLI arguments.
         else:
             pipeline = TransformDriver(wload.schedule_modules(parameters=params))
             payload = pipeline.apply(wload.payload_module())
+            runner = Runner(
+                payload,
+                mem_manager_cls=wload.memory_manager_class,
+                shared_libs=wload.shared_libs(),
+            )
             if args.check_result:
-                success = execute_and_check(wload, payload, args.verbose)
+                # Setup callback function to copy result from device to host.
+                D_host_copy, argument_access_callback = (
+                    Runner.get_gpu_argument_access_callback(
+                        wload.c_shape, wload.c_dtype
+                    )
+                )
+                runner.execute(
+                    host_input_buffers=wload._initial_host_arrays,
+                    payload_function_name=wload.payload_function_name,
+                    argument_access_callback=argument_access_callback,
+                )
+                success = check_results(wload, payload, [D_host_copy], args.verbose)
                 if not success:
                     raise ValueError("Result mismatch!")
 
-            times = run_benchmark(
-                wload, payload, nruns=args.nruns, nwarmup=args.nwarmup
+            times = runner.benchmark(
+                host_input_buffers=wload._initial_host_arrays,
+                nruns=args.nruns,
+                nwarmup=args.nwarmup,
             )
             times *= 1e6  # convert to microseconds
             elapsed = np.mean(times)
