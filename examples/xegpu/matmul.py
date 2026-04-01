@@ -174,7 +174,7 @@ class XeGPUMatMul:
         return ["libmlir_levelzero_runtime.so"]
 
 
-def check_results(mmul: XeGPUMatMul, payload: ir.Module, verbose: int = 0) -> bool:
+def check_results(mmul: XeGPUMatMul, payload: ir.Module, buffers: list[np.ndarray], verbose: int = 0) -> bool:
     """
     Check correctness of the result.
     """
@@ -193,7 +193,7 @@ def check_results(mmul: XeGPUMatMul, payload: ir.Module, verbose: int = 0) -> bo
     if mmul.has_relu:
         D_ref = np.maximum(D_ref, 0)
 
-    D_host = D_host_copy.astype(np.float32)
+    D_host = buffers[0].astype(np.float32)
     if verbose > 1:
         print("Reference solution:")
         print(D_ref)
@@ -456,7 +456,7 @@ enabled via CLI arguments.
                     payload_function_name=wload.payload_function_name,
                     argument_access_callback=argument_access_callback,
                 )
-                success = check_results(wload, payload, args.verbose)
+                success = check_results(wload, payload, [D_host_copy], args.verbose)
                 if not success:
                     raise ValueError("Result mismatch!")
 

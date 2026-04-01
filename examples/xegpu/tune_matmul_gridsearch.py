@@ -67,7 +67,7 @@ def run_experiment(
                 payload_function_name=wload.payload_function_name,
                 argument_access_callback=argument_access_callback,
             )
-            success = check_results(wload, payload, verbose=1)
+            success = check_results(wload, payload, [D_host_copy], verbose=1)
             if not success:
                 raise ValueError("Result mismatch!")
         if nruns is None and nwarmup is None:
