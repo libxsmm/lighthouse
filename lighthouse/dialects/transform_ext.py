@@ -1,8 +1,7 @@
 from typing import Sequence, Optional
 
 from mlir import ir
-from mlir.dialects import ext, transform, func, arith, scf, memref
-from mlir.dialects import linalg
+from mlir.dialects import ext, transform, func, arith, scf, memref, linalg
 from mlir.dialects.transform import DiagnosedSilenceableFailure
 
 from lighthouse.utils.mlir import func_cif
@@ -403,10 +402,8 @@ class GetTilingSizesOp(TransformExtensionDialect.Operation, name="get_tiling_siz
         """Get attribute suitable for use as a tiling size."""
         return ir.IntegerAttr.get(ir.IntegerType.get_signless(64), value)
 
-    @classmethod
-    def named_op_matmul_tiles(
-        cls, named_op: ir.OpView, tile_size: int
-    ) -> Sequence[int]:
+    @staticmethod
+    def named_op_matmul_tiles(named_op: ir.OpView, tile_size: int) -> Sequence[int]:
         """
         Get tiling sizes for Linalg matmul named ops variants.
 
@@ -436,10 +433,8 @@ class GetTilingSizesOp(TransformExtensionDialect.Operation, name="get_tiling_siz
             case _:
                 return []
 
-    @classmethod
-    def contract_tiles(
-        cls, contract: linalg.ContractOp, tile_size: int
-    ) -> Sequence[int]:
+    @staticmethod
+    def contract_tiles(contract: linalg.ContractOp, tile_size: int) -> Sequence[int]:
         """
         Get tiling sizes for Linalg contraction op.
 
@@ -480,7 +475,7 @@ class GetTilingSizesOp(TransformExtensionDialect.Operation, name="get_tiling_siz
         ) -> DiagnosedSilenceableFailure:
             target_ops = state.get_payload_ops(op.target)
             if len(target_ops) != 1:
-                return DiagnosedSilenceableFailure.Failure
+                return DiagnosedSilenceableFailure.SilenceableFailure
 
             tile_size = 32
             if op.tile_dim is not None:
@@ -536,3 +531,186 @@ def get_tiling_sizes(
         tile_dim = transform.ParamConstantOp(transform.AnyParamType.get(), param_attr)
 
     return GetTilingSizesOp(target=target, tile_dim=tile_dim)
+
+
+class GetTileableConsumersOp(
+    TransformExtensionDialect.Operation, name="get_tileable_consumers"
+):
+    """
+    Find consumer ops of the `target` operation that are tileable linalg ops.
+
+    If no such consumers are found, the operation returns the target itself.
+
+    Args:
+        target: Handle to target op
+    Returns:
+        List of tileable consumer ops, or the target op itself.
+    """
+
+    target: ext.Operand[transform.AnyOpType]
+    ops: ext.Result[transform.AnyOpType[()]] = ext.result(infer_type=True)
+
+    @classmethod
+    def attach_interface_impls(cls, ctx=None):
+        cls.TransformOpInterfaceModel.attach(cls.OPERATION_NAME, context=ctx)
+        cls.MemoryEffectsOpInterfaceModel.attach(cls.OPERATION_NAME, context=ctx)
+
+    @staticmethod
+    def get_op_users(val: ir.Value) -> list[ir.Operation]:
+        op_users = []
+        for use in val.uses:
+            user = use.owner
+            if not isinstance(user, ir.OpView):
+                continue
+            op_users.append(user.operation)
+        return op_users
+
+    @staticmethod
+    def is_tileable_op(op: ir.Operation) -> bool:
+        # TODO expand list as needed and/or check traits/interfaces
+        linalg_ops = [
+            linalg.ElementwiseOp,
+            linalg.AddOp,
+            linalg.SubOp,
+            linalg.MulOp,
+            linalg.DivOp,
+            linalg.ExpOp,
+            linalg.MaxOp,
+            linalg.MinOp,
+            linalg.FillOp,
+            linalg.MatmulOp,
+            linalg.GenericOp,
+        ]
+        return isinstance(op.opview, tuple(linalg_ops))
+
+    class TransformOpInterfaceModel(transform.TransformOpInterface):
+        @staticmethod
+        def apply(
+            op: "GetTileableConsumersOp",
+            _rewriter: transform.TransformRewriter,
+            results: transform.TransformResults,
+            state: transform.TransformState,
+        ) -> DiagnosedSilenceableFailure:
+            target_ops = state.get_payload_ops(op.target)
+
+            if len(target_ops) != 1:
+                return DiagnosedSilenceableFailure.SilenceableFailure
+
+            new_ops = []
+            target: ir.Operation = target_ops[0]
+            op_res = target.results
+            while len(op_res) == 1:
+                users = op.get_op_users(op_res[0])
+                if len(users) != 1:
+                    break
+                user = users[0]
+                if not op.is_tileable_op(user):
+                    break
+                new_ops.append(user)
+                op_res = user.results
+
+            if not new_ops:
+                new_ops = [target]
+            results.set_ops(op.ops, new_ops)
+            return DiagnosedSilenceableFailure.Success
+
+        @staticmethod
+        def allow_repeated_handle_operands(_op: "GetTileableConsumersOp") -> bool:
+            return False
+
+    class MemoryEffectsOpInterfaceModel(ir.MemoryEffectsOpInterface):
+        @staticmethod
+        def get_effects(op: ir.Operation, effects):
+            transform.only_reads_handle(op.op_operands, effects)
+            transform.produces_handle(op.results, effects)
+            transform.only_reads_payload(effects)
+
+
+def get_tileable_consumers(
+    target: ir.Value[transform.AnyOpType],
+) -> ir.Value:
+    """
+    snake_case wrapper to create a GetTileableConsumersOp.
+
+    Args:
+        target: Handle to target op
+    Returns:
+        List of tileable consumer ops, or the target op itself.
+    """
+    return GetTileableConsumersOp(target=target).ops
+
+
+class ExtractHandleOp(TransformExtensionDialect.Operation, name="extract_handle"):
+    """
+    Returns the handle at the specified index in `target`.
+
+    Args:
+        target: Handle(s) to target op(s)
+        index: Index of the handle to extract. Supports Python-style indexing.
+    Returns:
+        The handle at the specified index in `target`.
+    """
+
+    target: ext.Operand[transform.AnyOpType]
+    index: ext.Operand[transform.AnyParamType]
+    ops: ext.Result[transform.AnyOpType[()]] = ext.result(infer_type=True)
+
+    @classmethod
+    def attach_interface_impls(cls, ctx=None):
+        cls.TransformOpInterfaceModel.attach(cls.OPERATION_NAME, context=ctx)
+        cls.MemoryEffectsOpInterfaceModel.attach(cls.OPERATION_NAME, context=ctx)
+
+    class TransformOpInterfaceModel(transform.TransformOpInterface):
+        @staticmethod
+        def apply(
+            op: "ExtractHandleOp",
+            _rewriter: transform.TransformRewriter,
+            results: transform.TransformResults,
+            state: transform.TransformState,
+        ) -> DiagnosedSilenceableFailure:
+            target_ops = state.get_payload_ops(op.target)
+            index_attr = state.get_params(op.index)
+            if len(index_attr) == 1 and isinstance(index_attr[0], ir.IntegerAttr):
+                index = index_attr[0].value
+            else:
+                return DiagnosedSilenceableFailure.SilenceableFailure
+
+            n = len(target_ops)
+            if index >= n or index < -n:
+                raise IndexError(
+                    f"extract_handle: Invalid index {index} for target of length {len(target_ops)}"
+                )
+            handle = target_ops[index]
+            results.set_ops(op.ops, [handle])
+            return DiagnosedSilenceableFailure.Success
+
+        @staticmethod
+        def allow_repeated_handle_operands(_op: "ExtractHandleOp") -> bool:
+            return False
+
+    class MemoryEffectsOpInterfaceModel(ir.MemoryEffectsOpInterface):
+        @staticmethod
+        def get_effects(op: ir.Operation, effects):
+            transform.only_reads_handle(op.op_operands, effects)
+            transform.produces_handle(op.results, effects)
+            transform.only_reads_payload(effects)
+
+
+def extract_handle(
+    target: ir.Value[transform.AnyOpType],
+    index: int | ir.Value[transform.AnyParamType],
+) -> ir.Value:
+    """
+    snake_case wrapper to create a ExtractHandleOp.
+
+    Args:
+        target: Handle(s) to target op(s)
+        index: Index of the handle to extract. Supports Python-style indexing.
+    Returns:
+        The handle at the specified index in `target`.
+    """
+    if isinstance(index, int):
+        param_attr = GetTilingSizesOp.tile_param_attr(index)
+        index = transform.ParamConstantOp(transform.AnyParamType.get(), param_attr)
+
+    return ExtractHandleOp(target=target, index=index).result
