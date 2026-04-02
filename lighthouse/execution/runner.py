@@ -159,9 +159,13 @@ class Runner:
                 function_name = self.payload_benchmark_function_name
             else:
                 function_name = payload_function_name
+
+            # Now lookup and call the function
             func = self.engine.lookup(function_name)
             func(args)
 
+            # If an argument access callback is provided,
+            # use it to recover the output data from the device after execution.
             if argument_access_callback is not None:
                 argument_access_callback(
                     inputs, execution_engine=self.engine, memory_manager=mem_manager
@@ -208,21 +212,23 @@ class Runner:
         """
         Get a schedule that wraps the payload function in a benchmarking function.
         The function name is defined in Runner and will be used by the runner benchmark method.
+        This schedule must apply to the module before any other in an optimizing pipeline.
         """
-        with schedule_boilerplate(result_types=[transform.any_op_t()]) as (
-            schedule,
-            named_seq,
-        ):
-            named_func = structured.structured_match(
-                transform.AnyOpType.get(),
-                target=named_seq.bodyTarget,
-                ops={"func.func"},
-                op_attrs={"sym_name": ir.StringAttr.get(payload_func)},
-            )
-            bench_func = transform_ext.wrap_in_benching_func(
-                named_func, bench_name=Runner.payload_benchmark_function_name
-            )
-            transform.yield_([bench_func])
+        with ir.Location.unknown():
+            with schedule_boilerplate(result_types=[transform.any_op_t()]) as (
+                schedule,
+                named_seq,
+            ):
+                named_func = structured.structured_match(
+                    transform.AnyOpType.get(),
+                    target=named_seq.bodyTarget,
+                    ops={"func.func"},
+                    op_attrs={"sym_name": ir.StringAttr.get(payload_func)},
+                )
+                bench_func = transform_ext.wrap_in_benching_func(
+                    named_func, bench_name=Runner.payload_benchmark_function_name
+                )
+                transform.yield_([bench_func])
 
         schedule.body.operations[0].verify()
         return schedule

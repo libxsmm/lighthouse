@@ -46,11 +46,13 @@ class PipelineDriver:
         # Users can derive their own classes from Stage and add them to the pipeline with this method.
         self.stages.append(stage)
 
-    def apply(self, module: ir.Module) -> ir.Module:
+    def apply(self, module: ir.Module, print_after_all: bool = False) -> ir.Module:
         if module.context != self.context:
             raise ValueError("Module context does not match driver context.")
         for stage in self.stages:
             module = stage.apply(module)
+            if print_after_all:
+                print(f"After stage {stage}:\n{module}")
         return module
 
     def __len__(self):
@@ -138,8 +140,34 @@ class CompilerDriver:
             self.pipeline.add_pass(stage_name)
 
     def add_stages(self, stages: list[str]) -> None:
+        """
+        Add multiple stages to the pipeline.
+        """
         for s in stages:
             self.add_stage(s)
+
+    def add_module_stage(self, stage_module: ir.Module) -> None:
+        """
+        Add a stage in the form of an MLIR module.
+        The first transform schedule in the module will be applied to the payload module.
+        TODO: This is required now for the benchmark wrapper. We should not need such bypass.
+        """
+        if self.pipeline_fixed:
+            raise ValueError("Pipeline is fixed. Reset to start again.")
+        self.pipeline.add_transform(stage_module)
+
+    def make_function_callable(self, func_name: str) -> None:
+        """
+        Set the 'llvm.emit_c_interface' attribute of the given function in the module.
+        This is required to make the function callable from the execution engine.
+        It has to be called on a @func.func (not an @llvm.func), so should be called
+        before the LLVM lowering stages are added to the pipeline.
+        """
+        with self.context:
+            for func in self.module.body.operations:
+                if func.sym_name.value == func_name:
+                    func.attributes["llvm.emit_c_interface"] = ir.UnitAttr.get()
+                    break
 
     def reset(self) -> None:
         """Reset the pipeline to an empty state, allowing for new stages to be added."""
@@ -147,14 +175,14 @@ class CompilerDriver:
         self.module = None
         self.pipeline_fixed = False
 
-    def run(self) -> ir.Module:
+    def run(self, print_after_all: bool = False) -> ir.Module:
         if self.module is None:
             raise ValueError("Module must not be empty.")
         if len(self.pipeline) == 0:
             raise ValueError("Pipeline must have at least one stage.")
 
         # Apply the whole pipeline.
-        self.pipeline.apply(self.module)
+        self.pipeline.apply(self.module, print_after_all=print_after_all)
 
         # The pipeline is now fixed and cannot be modified until reset is called.
         # This is to prevent accidental modifications to the pipeline after it has been run,

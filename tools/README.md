@@ -23,8 +23,23 @@ lh-opt --stage=my-transform.mlir file.mlir
 lh-opt --stage=BufferizationBundle --stage=canonicalize --stage=my-transform.mlir --stage=canonicalize --stage=LLVMLoweringBundle file.mlir
 ```
 
-Note, this basic functionality is for testing purposes. For building larger pipelines a new method will need to be created.
-One idea is to use structured text files, like YAML or JSON, and then use `--stage=my-pipeline.json`.
+Note, this basic functionality is for testing purposes.
+
+## lh-run
+
+Executes a payload MLIR file, with optional optimizing pipeline.
+
+The way to use is demonstrated in the test `test/run/pipeline-check.mlir`:
+
+```
+// Runs module with random inputs
+lh-run --stage=my-pipeline.yaml file.mlir --entry-point=entry --input-shape=256x512,512x1024 --input-type=f32
+
+// Benchmarks the module above with random inputs
+lh-run --stage=my-pipeline.yaml file.mlir --entry-point=entry --input-shape=256x512,512x1024 --input-type=f32 --benchmark
+```
+
+Note, this basic functionality is for testing purposes.
 
 ## lh-tune
 
