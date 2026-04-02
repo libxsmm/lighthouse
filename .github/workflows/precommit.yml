@@ -32,4 +32,4 @@ jobs:
       - name: Run lit-enabled tests
         run: |
           export FILECHECK=FileCheck-18 # Ubuntu's llvm-dev appends a version number.
-          uv run pre-commit run --all-files
+          uv run lit -v .
