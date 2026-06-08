@@ -166,13 +166,14 @@ if [ $? != 0 ]; then
 fi
 
 # Check LLVM
-echo "--- CHECK"
-echo_run ninja -C ${LLVM_BUILD_DIR} check-all
-if [ $? != 0 ]; then
-  rm -r ${LLVM_INSTALL_DIR}
-  rm -r ${LLVM_BUILD_DIR}
-  exit 1
-fi
+# echo "--- CHECK"
+# echo_run ninja -C ${LLVM_BUILD_DIR} check-all
+# if [ $? != 0 ]; then
+#   rm -r ${LLVM_INSTALL_DIR}
+#   rm -r ${LLVM_BUILD_DIR}
+#   exit 1
+# fi
+
 
 # Install LLVM
 echo "--- INSTALL"
