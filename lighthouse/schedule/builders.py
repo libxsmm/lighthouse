@@ -73,19 +73,24 @@ def schedule_boilerplate(
     Returns:
         Schedule and named transform sequence
     """
-    if input_types is None:
-        input_types = [transform.any_op_t()]
-    if result_types is None:
-        result_types = []
 
-    schedule = create_schedule()
-    named_sequence = create_named_sequence(
-        schedule,
-        input_types=input_types,
-        result_types=result_types,
-        sym_name=sym_name,
-        is_readonly=is_readonly,
-    )
-    with ir.InsertionPoint(schedule.body):
-        with ir.InsertionPoint(named_sequence.body):
-            yield schedule, named_sequence
+    ctx = ir.Context()
+
+    with ctx:
+        with ir.Location.unknown():
+            if input_types is None:
+                input_types = [transform.any_op_t()]
+            if result_types is None:
+                result_types = []
+
+            schedule = create_schedule()
+            named_sequence = create_named_sequence(
+                schedule,
+                input_types=input_types,
+                result_types=result_types,
+                sym_name=sym_name,
+                is_readonly=is_readonly,
+            )
+            with ir.InsertionPoint(schedule.body):
+                with ir.InsertionPoint(named_sequence.body):
+                    yield schedule, named_sequence
