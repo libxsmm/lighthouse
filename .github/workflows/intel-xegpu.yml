@@ -128,3 +128,23 @@ jobs:
         uses: ./.github/actions/run-xegpu-test
         with:
           command: uv run python examples/xegpu/kernel_bench.py -l 1 -b 1
+
+      - name: Run XeGPU Kernel Bench level1-23 example
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/kernel_bench.py -l 1 -b 23 --compute-reference-on-cpu
+
+      - name: Run XeGPU Kernel Bench level1-97 example
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/kernel_bench.py -l 1 -b 97 --compute-reference-on-cpu
+
+      - name: Run XeGPU Kernel Bench level2-9 example
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/kernel_bench.py -l 2 -b 9
+
+      - name: Run XeGPU Kernel Bench level3-1 example
+        uses: ./.github/actions/run-xegpu-test
+        with:
+          command: uv run python examples/xegpu/kernel_bench.py -l 3 -b 1
