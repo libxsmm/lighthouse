@@ -25,6 +25,7 @@ from .ops.fuse_elementwise_op import fuse_elementwise_op
 from .ops.filter_by_name import filter_by_name
 from .ops.filter_reduction_ops import filter_reduction_ops
 from .ops.fuse_dependent_reduction_ops import fuse_dependent_reduction_ops
+from .ops.rewrite_attention_row_mask import rewrite_attention_row_mask
 from .ops.filter_contraction_ops import filter_contraction_ops
 from .ops.get_leading_unit_tile_sizes import get_leading_unit_tile_sizes
 from .ops.move_offsets_to_subview import move_offsets_to_subview
@@ -73,6 +74,7 @@ __all__ = [
     "register_and_load",
     "replace",
     "reverse_handles",
+    "rewrite_attention_row_mask",
     "sfc_remap_forall",
     "sink_extract_slice_into_loop",
     "sink_normalization_past_contraction",
