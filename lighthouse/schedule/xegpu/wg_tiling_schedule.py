@@ -50,6 +50,7 @@ def apply_gemm_tiling(
             apply_cleanup=False,
         )
         transform.apply_dce(wg_loop)
+        wg_loop = transform_ext.fuse_forall_epilogue(wg_loop)
 
         # k loop tiling
         wg_matmul = match(wg_loop, ops={"linalg.matmul"})
