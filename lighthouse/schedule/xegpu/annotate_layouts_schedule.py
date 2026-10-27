@@ -194,7 +194,6 @@ def annotate_gemm(
         layout_prefetch_b,
         prefetch_b_nb,
     )
-
     # C tile layout
     output_layout = {
         "sg_layout": sg_layout,
@@ -203,10 +202,14 @@ def annotate_gemm(
     }
     # C tile dpas anchor layout
     xegpu.set_anchor_layout(dpas_op, index=2, **output_layout)
-    # annotate store op
-    # FIXME trace consumers of dpas op?
+
     store_op_c = lh_transform.match_op(gpu_func_op, "xegpu.store_nd")
-    xegpu.set_anchor_layout(store_op_c, **output_layout)
+    with lh_transform.foreach(store_op_c) as store:
+        store_layout = transform_ext.infer_gemm_store_layout(
+            dpas_op, store, **output_layout
+        )
+        transform.annotate(store, "layout", param=store_layout)
+        transform.yield_()
 
     # annotate the 1d load of the broadcast op with a slice layout
     # NOTE assumes that xegpu.load is followed by vector.broadcast
