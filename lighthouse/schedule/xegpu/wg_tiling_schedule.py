@@ -22,9 +22,6 @@ def apply_gemm_tiling(
 ) -> ir.Operation:
     """Apply GEMM tiling to the given function."""
 
-    # Fuse elementwise ops first to simplify the graph.
-    func = apply_registered_pass(func, "linalg-fuse-elementwise-ops")
-
     matmul_ops = lh_transform.match_op(func, "linalg.matmul")
     # Ensure lowering fails if no matmul ops exist.
     transform_ext.extract_handle(matmul_ops, 0, silenceable=True)
