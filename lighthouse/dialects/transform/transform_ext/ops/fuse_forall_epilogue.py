@@ -233,7 +233,7 @@ def _image(op, tiles):
     return None
 
 
-def _plan(loop):
+def _plan(loop, allowed=None):
     if (
         len(loop.results) != 1
         or loop.dynamicLowerBound
@@ -271,20 +271,31 @@ def _plan(loop):
     for offset in insert.static_offsets:
         if ir.ShapedType.is_dynamic_size(int(offset)):
             value = next(dynamic)
+            size, extent = sizes[len(offsets)], shape[len(offsets)]
+            # Normalized loops (unit step) address the tile as `iv * size`.
+            scale = 1
+            owner = value.owner
+            if isinstance(owner, affine.AffineApplyOp) and len(owner.operands) == 1:
+                if owner.map.value != ir.AffineMap.get(
+                    1, 0, [ir.AffineExpr.get_dim(0) * size]
+                ):
+                    return None
+                value, scale = owner.operands[0], size
             if value not in body.arguments[:rank]:
                 return None
             index = list(body.arguments[:rank]).index(value)
-            size, extent = sizes[len(offsets)], shape[len(offsets)]
-            step = int(loop.staticStep[index])
+            step = int(loop.staticStep[index]) * scale
             if (
                 index in used_ivs
                 or int(loop.staticLowerBound[index]) != 0
                 or not (step == size or size == extent and step > size)
-                or int(loop.staticUpperBound[index]) != extent
+                or int(loop.staticUpperBound[index]) * scale != extent
             ):
                 return None
             used_ivs.add(index)
-            offsets.append(_zero() if size == extent else ir.AffineExpr.get_dim(index))
+            offsets.append(
+                _zero() if size == extent else ir.AffineExpr.get_dim(index) * scale
+            )
         elif offset == 0 and sizes[len(offsets)] == shape[len(offsets)]:
             offsets.append(_zero())
         else:
@@ -313,6 +324,8 @@ def _plan(loop):
         if not any(value in tiles for value in candidate.operands):
             continue
         if not isinstance(candidate, supported):
+            continue
+        if allowed is not None and candidate.operation not in allowed:
             continue
         image = _image(candidate, tiles)
         if image is None:
@@ -521,12 +534,16 @@ class FuseForallEpilogueOp(
     tensor and preserve complete slice/concat dimensions. External users are
     preserved as additional loop results. Each DAG node is cloned exactly once.
 
-    Unsupported plans are a successful no-match, returning the original loop.
-    Invalid targets are diagnosed. The loop handle is consumed; nested handles
-    must be reacquired from the returned loop.
+    If `consumers` is given, only those ops are fused, and all of them must be;
+    otherwise the transform is a silenceable failure. Without `consumers`, all
+    supported transitive consumers are fused and unsupported plans are a
+    successful no-match, returning the original loop. Invalid targets are
+    diagnosed. The handles are consumed; nested handles must be reacquired from
+    the returned loop.
     """
 
     target: ext.Operand[transform.AnyOpType]
+    consumers: ext.Operand[transform.AnyOpType] | None = None
     result: ext.Result[transform.AnyOpType[()]] = ext.infer_result()
 
     @classmethod
@@ -542,7 +559,16 @@ class FuseForallEpilogueOp(
                 op.location.emit_error("fuse_forall_epilogue expects one scf.forall")
                 return DiagnosedSilenceableFailure.DefiniteFailure
             loop = targets[0].opview
-            plan = _plan(loop)
+            if op.consumers is None:
+                plan = _plan(loop)
+            else:
+                allowed = {c.operation for c in state.get_payload_ops(op.consumers)}
+                if not allowed:
+                    results.set_ops(op.result, [loop.operation])
+                    return DiagnosedSilenceableFailure.Success
+                plan = _plan(loop, allowed)
+                if plan is None or {n.operation for n in plan[2]} != allowed:
+                    return DiagnosedSilenceableFailure.SilenceableFailure
             result = loop.operation if plan is None else _rewrite(loop, plan, rewriter)
             results.set_ops(op.result, [result])
             return DiagnosedSilenceableFailure.Success
@@ -561,5 +587,8 @@ class FuseForallEpilogueOp(
             )
 
 
-def fuse_forall_epilogue(target: ir.Value[transform.AnyOpType]) -> ir.Value:
-    return FuseForallEpilogueOp(target=target).result
+def fuse_forall_epilogue(
+    target: ir.Value[transform.AnyOpType],
+    consumers: ir.Value[transform.AnyOpType] | None = None,
+) -> ir.Value:
+    return FuseForallEpilogueOp(target=target, consumers=consumers).result
