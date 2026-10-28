@@ -15,6 +15,9 @@ class TagSubgraphsOp(TransformExtensionDialect.Operation, name="tag_subgraphs"):
     `transform_ext.subgraph_kind` and `transform_ext.subgraph_id` attributes,
     and the op to tile additionally gets `transform_ext.subgraph_anchor`.
     Supported kinds:
+      - "reduction": a generic reduction with a closed elementwise
+        normalization DAG, anchored at its final elementwise output. Match
+        before GEMM to materialize normalization once rather than per GEMM tile.
       - "gemm": matmul with its single-use elementwise epilogue chain and the
         elementwise producers feeding it. Producers that also have users
         outside the subgraph are cloned so each subgraph recomputes them.

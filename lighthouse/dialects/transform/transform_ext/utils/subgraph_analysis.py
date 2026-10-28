@@ -18,6 +18,9 @@ from mlir.dialects import tensor
 from lighthouse.dialects.transform.transform_ext.ops.filter_elementwise import (
     is_elementwise,
 )
+from lighthouse.dialects.transform.transform_ext.ops.filter_reduction_ops import (
+    is_reduction_op,
+)
 from lighthouse.utils.mlir import opview
 
 SUBGRAPH_KIND_ATTR_NAME = "transform_ext.subgraph_kind"
@@ -187,7 +190,49 @@ def _match_elementwise(
     return []
 
 
+def _match_reduction(
+    op: ir.Operation, block_ops: list
+) -> list[tuple[list, ir.Operation]]:
+    """Claim a closed generic reduction and its elementwise normalization DAG."""
+    if op.name != "linalg.generic" or not is_reduction_op(op) or is_tagged(op):
+        return []
+
+    def candidate(value):
+        return (
+            value in block_ops
+            and not is_tagged(value)
+            and (_is_elementwise_linalg(value) or value == op)
+        )
+
+    members, worklist = [op], [op]
+    while worklist:
+        current = worklist.pop()
+        neighbors = _users(current) + [
+            p for p in map(_producer, current.operands) if p is not None
+        ]
+        for neighbor in neighbors:
+            if neighbor not in members and candidate(neighbor):
+                members.append(neighbor)
+                worklist.append(neighbor)
+    sinks = [
+        member for member in members if not any(u in members for u in _users(member))
+    ]
+    if len(sinks) != 1 or not _is_elementwise_linalg(sinks[0]):
+        return []
+    anchor = sinks[0]
+    if any(
+        u not in members
+        for member in members
+        if member != anchor
+        for u in _users(member)
+    ):
+        return []
+    members.sort(key=block_ops.index)
+    return [(members, anchor)]
+
+
 SUBGRAPH_MATCHERS: dict[str, Callable] = {
+    "reduction": _match_reduction,
     "gemm": _match_gemm,
     "elementwise": _match_elementwise,
 }

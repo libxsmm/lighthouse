@@ -51,15 +51,41 @@ def apply_subgraph_tiling(
     force_k_tile: int | None = None,
     device: str | None = None,
 ) -> ir.Operation:
-    """Partition the function into GEMM and elementwise subgraphs and tile each
-    subgraph into its own workgroup-parallel scf.forall, i.e. its own kernel.
+    """Partition reduction, GEMM and elementwise subgraphs and tile each into
+    its own workgroup-parallel scf.forall, i.e. its own kernel.
 
-    GEMM subgraphs are matched first and claim their epilogue chains; the
+    Normalization reductions are claimed before GEMM to materialize their
+    outputs once, including when shared by multiple projections.
+    GEMM subgraphs then claim their epilogue chains; the
     remaining elementwise ops form separate subgraphs. Pure elementwise graphs
     are also supported. Fails silenceably if a linalg op is left unpartitioned.
     """
 
-    func = transform_ext.tag_subgraphs(func, kinds=["gemm", "elementwise"])
+    func = transform_ext.tag_subgraphs(func, kinds=["reduction", "gemm", "elementwise"])
+
+    with lh_transform.foreach(_subgraph_anchors(func, "reduction")) as anchor:
+        # Standalone reductions keep the existing schedule and its overrides.
+        transform_ext.extract_handle(
+            lh_transform.match_op(func, "linalg.matmul"), 0, silenceable=True
+        )
+        producers, _ = transform_ext.get_subgraph_ops(anchor)
+        reduction = transform_ext.filter_reduction_ops(producers)
+        wg_tile, _, reduction_tile = transform_ext.infer_xegpu_reduction_params(
+            reduction
+        )
+        _, [wg_loop], _ = lh_transform.tile(
+            anchor,
+            tile_sizes=wg_tile,
+            fuse_producers=True,
+            use_forall=True,
+            apply_cleanup=False,
+        )
+        lh_transform.cleanup(wg_loop)
+        wg_loop = transform_ext.fuse_elementwise_region(wg_loop)
+        lh_transform.cleanup(wg_loop)
+        _tile_reduction_body(wg_loop, reduction_tile)
+        transform.yield_()
+    transform.apply_dce(func)
 
     with lh_transform.foreach(_subgraph_anchors(func, "gemm")) as anchor:
         producers, consumers = transform_ext.get_subgraph_ops(anchor)
@@ -100,6 +126,43 @@ def apply_subgraph_tiling(
     func = transform_ext.split_concat_output(func)
     lh_transform.cleanup(func)
     return func
+
+
+def _tile_reduction_body(wg_loop, reduction_tile):
+    """Tile a normalization kernel's output and reductions within its WG."""
+    anytype = transform.AnyOpType.get()
+
+    def fuse_producers(target, loop):
+        producers = transform_ext.filter_by_name(
+            transform_ext.filter_elementwise(transform_ext.trace_producers(target)),
+            "linalg.generic",
+        )
+        _, loop = structured.structured_fuse_into_containing_op(
+            anytype, anytype, producer_op=producers, containing_op=loop
+        )
+        return loop
+
+    generic_ops = match(wg_loop, ops={"linalg.generic"})
+    leaf = transform_ext.extract_handle(
+        transform_ext.filter_elementwise(generic_ops), -1, silenceable=True
+    )
+    reductions = transform_ext.reverse_handles(
+        transform_ext.filter_reduction_ops(generic_ops)
+    )
+    res = structured.TileUsingForOp(leaf, sizes=reduction_tile).results
+    loop = fuse_producers(res[0], res[1])
+    transform_ext.sink_extract_slice_into_loop(loop)
+    with lh_transform.foreach(reductions) as reduction:
+        tiled, loops, _ = lh_transform.tile(
+            reduction,
+            tile_sizes=reduction_tile,
+            fuse_producers=False,
+            use_forall=False,
+            apply_cleanup=False,
+        )
+        fuse_producers(tiled, loops[0])
+        transform.apply_dce(wg_loop)
+        transform.yield_()
 
 
 def apply_reduction_tiling(
@@ -155,79 +218,9 @@ def apply_reduction_tiling(
         )
         lh_transform.cleanup(func)
 
-    def fuse_elemwise_producers_to_loop(target, parent_loop):
-        """Fuses all elementwise producer ops of `target` into `parent_loop`."""
-        producers = transform_ext.trace_producers(target)
-        elemwise_producers = transform_ext.filter_elementwise(producers)
-        elemwise_producers = transform_ext.filter_by_name(
-            elemwise_producers,
-            "linalg.generic",
-        )
-        _, fused_loop = structured.structured_fuse_into_containing_op(
-            anytype,
-            anytype,
-            producer_op=elemwise_producers,
-            containing_op=parent_loop,
-        )
-        return fused_loop
-
-    def tile_and_fuse_reduction(reduction_op, tile_sizes):
-        # Tile the reduction op.
-        tiled_op, tile_loops, _ = lh_transform.tile(
-            reduction_op,
-            tile_sizes=tile_sizes,
-            fuse_producers=False,
-            use_forall=False,
-            apply_cleanup=False,
-        )
-        fuse_elemwise_producers_to_loop(tiled_op, tile_loops[0])
-
-    # Reduction tiling is always applied; the param carries the sizes.
-    apply_reduction_tiling = True
-
-    if apply_reduction_tiling:
-        # Reduction dimension tiling.
-        # 1. Tile the leaf elemwise linalg.generic op and fuse its elemwise
-        #    linalg.generic producers into the resulting loop.
-        # 2. Tile each reduction linalg.generic op (from last to first) and fuse its
-        #    elemwise producers into the resulting loop.
-
-        wg_loop = transform_ext.extract_handle(
-            lh_transform.match_op(func, "scf.forall"), 0
-        )
-        generic_ops = match(wg_loop, ops={"linalg.generic"})
-        elemwise_ops = transform_ext.filter_elementwise(generic_ops)
-        leaf_elemwise = transform_ext.extract_handle(elemwise_ops, -1, silenceable=True)
-        reduction_ops = transform_ext.filter_reduction_ops(generic_ops)
-
-        # Tile trailing elemwise op first.
-        res = structured.TileUsingForOp(leaf_elemwise, sizes=reduction_tile).results
-        # NOTE tile_using_for can return 2 or 3 values
-        tiled_elemwise = res[0]
-        tile_loop = res[1]
-
-        # Fuse all elemwise producers into the tiled leaf loop.
-        elemwise_for = fuse_elemwise_producers_to_loop(tiled_elemwise, tile_loop)
-
-        # Sink the loop's init tensor.extract_slice into the loop, dropping the
-        # surrounding extract/insert_slice pair. This is required for clean
-        # vectorization.
-        elemwise_for = transform_ext.sink_extract_slice_into_loop(elemwise_for)
-
-        # Tile and fuse the reduction loops in reverse order. After each fusion
-        # step, DCE removes the dead untiled elementwise epilogue so it cannot
-        # create a cross-loop use that breaks the next tile-fuse iteration. Note
-        # that DCE does not invalidate the reduction loop handles as the tracking
-        # listener only invalidates modified handles and the reduction loops are
-        # alive and thus not removed.
-        reduction_ops = transform_ext.reverse_handles(reduction_ops)
-        with lh_transform.foreach(reduction_ops) as reduction_op:
-            tile_and_fuse_reduction(reduction_op, reduction_tile)
-            transform.apply_dce(wg_loop)
-            transform.yield_()
-
-        # Fuse all sibling elementwise ops in scf.for loops.
-        func = apply_registered_pass(func, "linalg-fuse-elementwise-ops")
+    wg_loop = transform_ext.extract_handle(lh_transform.match_op(func, "scf.forall"), 0)
+    _tile_reduction_body(wg_loop, reduction_tile)
+    func = apply_registered_pass(func, "linalg-fuse-elementwise-ops")
 
     with ir.InsertionPoint(transform.apply_patterns(func).patterns):
         structured.apply_patterns_linalg_fold_unit_extent_dims_via_slices()

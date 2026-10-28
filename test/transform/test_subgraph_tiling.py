@@ -82,6 +82,39 @@ REDUCTION = SOURCE.replace(
 """,
 )
 
+NORMALIZED = SOURCE.replace(
+    "  %mm1 = linalg.matmul",
+    """  %ne = tensor.empty() : tensor<256x128xf32>
+  %square = linalg.generic {indexing_maps=[#id2,#id2],
+      iterator_types=["parallel","parallel"]}
+    ins(%x : tensor<256x128xf32>) outs(%ne : tensor<256x128xf32>) {
+  ^bb0(%a: f32, %o: f32):
+    %v = arith.mulf %a, %a : f32
+    linalg.yield %v : f32
+  } -> tensor<256x128xf32>
+  %se = tensor.empty() : tensor<256xf32>
+  %si = linalg.fill ins(%zero : f32) outs(%se : tensor<256xf32>) -> tensor<256xf32>
+  %norm_sum = linalg.generic {
+      indexing_maps=[#id2,affine_map<(m,n)->(m)>],
+      iterator_types=["parallel","reduction"]}
+    ins(%square : tensor<256x128xf32>) outs(%si : tensor<256xf32>) {
+  ^bb0(%a: f32, %acc: f32):
+    %v = arith.addf %a, %acc : f32
+    linalg.yield %v : f32
+  } -> tensor<256xf32>
+  %norm = linalg.generic {
+      indexing_maps=[#id2,affine_map<(m,n)->(m)>,#id2],
+      iterator_types=["parallel","parallel"]}
+    ins(%x, %norm_sum : tensor<256x128xf32>, tensor<256xf32>)
+    outs(%ne : tensor<256x128xf32>) {
+  ^bb0(%a: f32, %s: f32, %o: f32):
+    %scale = math.rsqrt %s : f32
+    %v = arith.mulf %a, %scale : f32
+    linalg.yield %v : f32
+  } -> tensor<256x128xf32>
+  %mm1 = linalg.matmul""",
+).replace("ins(%x, %w", "ins(%norm, %w")
+
 
 def operations(module, prefix):
     found = []
@@ -186,21 +219,24 @@ def test_tiling():
 # CHECK-NEXT: linalg.generic
 
 
-def test_numerics():
+def test_numerics(source=SOURCE):
     rng = np.random.default_rng(7)
     x = rng.normal(size=(256, 128)).astype(np.float32)
     w1 = rng.normal(size=(128, 256)).astype(np.float32)
     w2 = rng.normal(size=(128, 256)).astype(np.float32)
-    heads = (x @ w2).reshape(4, 64, 256)
-    expected = [np.maximum(x @ w1, 0), -heads * heads]
-    module = run(SOURCE, tile)
+    normalized = (
+        x if source == SOURCE else x / np.sqrt(np.sum(x * x, axis=-1, keepdims=True))
+    )
+    heads = (normalized @ w2).reshape(4, 64, 256)
+    expected = [np.maximum(normalized @ w1, 0), -heads * heads]
+    module = run(source, tile)
     PassManager.parse(
         "builtin.module(empty-tensor-to-alloc-tensor,"
         "one-shot-bufferize{bufferize-function-boundaries "
         "function-boundary-type-conversion=identity-layout-map},"
         "scf-forall-to-for,buffer-deallocation-pipeline,"
         "convert-linalg-to-loops,expand-strided-metadata,lower-affine,"
-        "convert-scf-to-cf)"
+        "convert-scf-to-cf,convert-math-to-llvm)"
     ).run(module.operation)
     Runner.make_function_callable(module, "payload")
     PassManager.parse(
@@ -218,8 +254,34 @@ def test_numerics():
 # CHECK-NEXT: Tiled subgraphs match NumPy
 
 
+def test_mixed_reduction():
+    module = run(NORMALIZED, tile)
+    loops = [op for op in operations(module, "scf.forall") if op.name == "scf.forall"]
+    assert len(loops) == 4, str(module)
+    assert len(operations(loops[0], "math.rsqrt")) == 1
+    assert not operations(loops[0], "linalg.matmul")
+    for loop in loops[1:]:
+        assert not operations(loop, "math.rsqrt"), (
+            "normalization must not be recomputed"
+        )
+    assert len(operations(module, "linalg.matmul")) == 2
+    test_numerics(NORMALIZED)
+    print("Shared reduction is materialized once before both GEMM consumers")
+
+
+# CHECK-LABEL: test_mixed_reduction
+# CHECK-NEXT: Tiled subgraphs match NumPy
+# CHECK-NEXT: Shared reduction is materialized once before both GEMM consumers
+
+
 with ir.Context(), ir.Location.unknown():
     lh_dialects.register_and_load()
-    for test in (test_tagging, test_untagged, test_tiling, test_numerics):
+    for test in (
+        test_tagging,
+        test_untagged,
+        test_tiling,
+        test_numerics,
+        test_mixed_reduction,
+    ):
         print(test.__name__)
         test()
