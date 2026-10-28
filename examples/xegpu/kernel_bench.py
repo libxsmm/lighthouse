@@ -683,7 +683,7 @@ def lower_and_execute_benchmark(
         stop_at_stage=stop_at_stage,
         params_cache_json=f"kb_params_level{level}-{id}.json",
         dump_parameters=dump_parameters,
-        enable_tuning=execute,
+        enable_tuning=False,  # execute,
         verbose=verbose,
     )
     backend = gpu_backend(
