@@ -137,10 +137,15 @@ def _dpas_shape_and_transpose(
     if a_shape is None or b_shape is None:
         raise ValueError("Could not infer global shape of dpas operands")
 
-    # A source is [K, M] when transposed, else [M, K].
-    m, k = (a_shape[1], a_shape[0]) if transpose_a else (a_shape[0], a_shape[1])
+    # A source is [K, M] when transposed, else [M, K]. The parallel
+    # dimension may still be expanded (e.g. [batch, sequence, K]).
+    m, k = (
+        (math.prod(a_shape[1:]), a_shape[0])
+        if transpose_a
+        else (math.prod(a_shape[:-1]), a_shape[-1])
+    )
     # B source is [N, K] when transposed, else [K, N].
-    n = b_shape[0] if transpose_b else b_shape[1]
+    n = math.prod(b_shape[:-1]) if transpose_b else math.prod(b_shape[1:])
     return (m, n, k), transpose_a, transpose_b
 
 

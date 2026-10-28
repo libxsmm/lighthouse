@@ -167,6 +167,18 @@ module {
 }
 """
 
+# Rank-preserving subviews may retain the batch/sequence dimensions even
+# though their descriptor and DPAS operand are two-dimensional.
+XEGPU_DPAS_COLLAPSED_M = XEGPU_DPAS.replace(
+    "memref<1024x8192xbf16>", "memref<4x256x8192xbf16>"
+).replace(
+    "    %ta = xegpu.create_nd_tdesc %arg1 : memref<4x256x8192xbf16>",
+    "    %view = memref.subview %arg1[0,0,0] [1,256,8192] [1,1,1] "
+    ": memref<4x256x8192xbf16> to memref<256x8192xbf16, strided<[8192,1]>>\n"
+    "    %ta = xegpu.create_nd_tdesc %view "
+    ": memref<256x8192xbf16, strided<[8192,1]>>",
+)
+
 
 def find_op(op: ir.Operation, name: str):
     """First op named `name` in `op`'s nested regions, or None."""
@@ -217,3 +229,7 @@ run("vector_contract_collapsed_m", VECTOR_CONTRACT_COLLAPSED_M, "vector.contract
 # CHECK-LABEL: Test: xegpu_dpas
 # CHECK: shape=(1024, 4096, 8192) transpose_a=False transpose_b=True
 run("xegpu_dpas", XEGPU_DPAS, "xegpu.dpas")
+
+# CHECK-LABEL: Test: xegpu_dpas_collapsed_m
+# CHECK: shape=(1024, 4096, 8192) transpose_a=False transpose_b=True
+run("xegpu_dpas_collapsed_m", XEGPU_DPAS_COLLAPSED_M, "xegpu.dpas")
