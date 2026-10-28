@@ -588,6 +588,153 @@ def lower_to_llvm(
     return driver.apply(mod)
 
 
+def dump_verification_failure(
+    result: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    atol: float,
+    rtol: float,
+    max_samples: int = 8,
+) -> None:
+    """Print bounded error diagnostics without rounding differences in bf16."""
+    print(
+        f"Result shape={tuple(result.shape)}, dtype={result.dtype}; "
+        f"reference shape={tuple(reference.shape)}, dtype={reference.dtype}"
+    )
+    if result.shape != reference.shape:
+        print("Shape mismatch; elementwise error diagnostics skipped.")
+        return
+    actual = result.detach().to(device="cpu", dtype=torch.float64)
+    expected = reference.detach().to(device="cpu", dtype=torch.float64)
+    close = torch.isclose(result, reference, atol=atol, rtol=rtol).cpu()
+    failed = ~close
+    count = int(failed.sum())
+    total = failed.numel()
+    print(f"Failing elements: {count}/{total} ({100 * count / max(total, 1):.6f}%)")
+    for label, value in (("Result", actual), ("Reference", expected)):
+        finite = value[torch.isfinite(value)]
+        limits = (
+            f"[{finite.min().item():.9g}, {finite.max().item():.9g}]"
+            if finite.numel()
+            else "empty"
+        )
+        print(
+            f"{label} finite range: {limits}; "
+            f"NaN={int(torch.isnan(value).sum())}, "
+            f"+Inf={int(torch.isposinf(value).sum())}, "
+            f"-Inf={int(torch.isneginf(value).sum())}"
+        )
+    if not total:
+        return
+
+    finite_pairs = torch.isfinite(actual) & torch.isfinite(expected)
+    error = actual - expected
+    abs_error = error.abs()
+    allowed = atol + rtol * expected.abs()
+    finite_errors = abs_error[finite_pairs]
+    if finite_errors.numel():
+        signed = error[finite_pairs]
+        print(
+            f"Finite-pair error: max_abs={finite_errors.max().item():.9g}, "
+            f"mean_abs={finite_errors.mean().item():.9g}, "
+            f"RMSE={signed.square().mean().sqrt().item():.9g}, "
+            f"mean_signed={signed.mean().item():.9g}"
+        )
+        near_zero = finite_pairs & (expected.abs() <= atol)
+        print(
+            f"Failures where |reference| <= atol: "
+            f"{int((failed & near_zero).sum())}/{int(near_zero.sum())}; "
+            f"failures at reference == 0: {int((failed & (expected == 0)).sum())}"
+        )
+        required_atol = max(
+            0.0,
+            (abs_error[finite_pairs] - rtol * expected[finite_pairs].abs())
+            .max()
+            .item(),
+        )
+        excess = (abs_error - atol).clamp_min(0)
+        nonzero = finite_pairs & (expected != 0)
+        required_rtol = (
+            (excess[nonzero] / expected[nonzero].abs()).max().item()
+            if nonzero.any()
+            else 0.0
+        )
+        if (finite_pairs & (expected == 0) & (excess > 0)).any():
+            required_rtol = float("inf")
+        print("Possible tolerances for finite pairs only (not a recommendation):")
+        print(f"  atol={required_atol:.9g}, rtol={rtol:.9g}")
+        print(f"  atol={atol:.9g}, rtol={required_rtol:.9g}")
+
+    def show_samples(label: str, candidates: torch.Tensor, score: torch.Tensor):
+        indices = candidates.flatten().nonzero().flatten()
+        if not indices.numel():
+            return
+        ranked = score.flatten()[indices].argsort(descending=True)
+        print(label)
+        for flat_index in indices[ranked[:max_samples]].tolist():
+            remaining = flat_index
+            coords = []
+            for extent in reversed(actual.shape):
+                coords.append(remaining % extent)
+                remaining //= extent
+            index = tuple(reversed(coords))
+            print(
+                f"  index={index}: result={actual[index].item():.9g}, "
+                f"reference={expected[index].item():.9g}, "
+                f"signed_error={error[index].item():.9g}, "
+                f"abs_error={abs_error[index].item():.9g}, "
+                f"allowed={allowed[index].item():.9g}"
+            )
+
+    print(f"atol={atol:.9g}, rtol={rtol:.9g}; allowed = atol + rtol * |reference|")
+    show_samples(
+        "Largest absolute errors (including passing elements):", finite_pairs, abs_error
+    )
+    show_samples(
+        "Worst failing elements by excess over allowed error:",
+        failed & finite_pairs,
+        abs_error - allowed,
+    )
+    show_samples(
+        "Non-finite mismatches:", failed & ~finite_pairs, torch.zeros_like(abs_error)
+    )
+
+
+@torch.no_grad()
+def prepare_verification_inputs(
+    model: torch.nn.Module,
+    inputs: list[torch.Tensor],
+    *,
+    identity_weights: bool,
+    power_of_two_inputs: list[int] | None,
+) -> None:
+    """Simplify verification data without changing the model graph."""
+    linears = [
+        module for module in model.modules() if isinstance(module, torch.nn.Linear)
+    ]
+    if identity_weights and not linears:
+        raise ValueError("--identity-weights requires a model with a Linear module")
+    for index in power_of_two_inputs or []:
+        if not 0 <= index < len(inputs):
+            raise ValueError(
+                f"--power-of-two-inputs: input index {index} is out of range"
+            )
+        value = inputs[index]
+        if not value.is_floating_point() or not bool(torch.isfinite(value).all()):
+            raise ValueError(
+                f"--power-of-two-inputs: input {index} must be finite and floating-point"
+            )
+    if identity_weights:
+        for module in linears:
+            torch.nn.init.eye_(module.weight)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+    for index in power_of_two_inputs or []:
+        value = inputs[index]
+        mantissa, exponent = torch.frexp(value.float())
+        value.copy_(torch.ldexp(mantissa.sign(), exponent - 1))
+
+
 def lower_and_execute_benchmark(
     filepath: str,
     level: int,
@@ -602,6 +749,8 @@ def lower_and_execute_benchmark(
     stop_at_stage: str | None = None,
     verbose: int = 0,
     dump_parameters: bool = True,
+    identity_weights: bool = False,
+    power_of_two_inputs: list[int] | None = None,
 ) -> dict:
     """
     High-level function to lower and execute a KernelBench benchmark.
@@ -620,12 +769,18 @@ def lower_and_execute_benchmark(
         stop_at_stage: Stage at which to stop the lowering pipeline.
         verbose: Verbosity level.
         dump_parameters: Whether to save applied schedule parameters as JSON.
+        identity_weights: Use rectangular identity Linear weights and zero biases
+            for verification only.
+        power_of_two_inputs: Zero-based input indices whose nonzero magnitudes
+            are rounded down to powers of two for verification only.
     Returns:
         A dictionary containing benchmark performance metrics.
     """
     assert datatype in ["f16", "bf16"], "Unsupported datatype"
     model_dtype = dtype_to_torch_dtype(datatype)
     execute = stop_at_stage is None
+
+    torch.manual_seed(42)  # set random seed
 
     # import torch model
     forced_inputs = None
@@ -648,12 +803,24 @@ def lower_and_execute_benchmark(
     )
 
     # initialize all model weights to random values
-    torch.manual_seed(42)  # set random seed
     for param in torch_model.parameters():
         torch.nn.init.uniform_(param, a=-0.5, b=0.5)
         if is_mlp and param.ndim == 2:
             # scale columns to unit norm for more stable correctness verification
             param.data /= param.data.norm(dim=0, keepdim=True) + 1e-6
+
+    prepare_verification_inputs(
+        torch_model,
+        torch_inputs,
+        identity_weights=identity_weights,
+        power_of_two_inputs=power_of_two_inputs,
+    )
+    if identity_weights or power_of_two_inputs:
+        print(
+            f"Verification data: identity_weights={identity_weights}, "
+            f"power_of_two_inputs={power_of_two_inputs or []}; "
+            "dense random weights and selected inputs will be used for timing"
+        )
 
     if execute:
         if compute_reference_on_cpu:
@@ -750,21 +917,14 @@ def lower_and_execute_benchmark(
         verified = 1 if success else 0
         print(f"Verification {'PASSED' if success else 'FAILED'}")
         if verbose > 0 and not success:
-            diff = result - result_ref
-            # compute max absolute and relative differences to guide tolerance
-            max_abs_diff = abs(diff).max()
-            print(f"Reference solution range: [{result_ref.min()}, {result_ref.max()}]")
-            print(f"Max abs difference: {max_abs_diff:.3e}")
-
-            # compute require atol/rtol for this result keeping rtol/atol fixed
-            print(f"atol={atol:.3e}, rtol={rtol:.3e}")
-            abs_diff = diff.abs()
-            abs_ref = result_ref.abs()
-            required_atol = (abs_diff - rtol * abs_ref).max().item()
-            required_rtol = ((abs_diff - atol) / abs_ref.clamp_min(1e-30)).max().item()
-            print("Possible tolerances for this result to pass:")
-            print(f"  atol={required_atol:.3e}, rtol={rtol:.3e}")
-            print(f"  atol={atol:.3e}, rtol={required_rtol:.3e}")
+            print(f"Reference backend: {'CPU' if compute_reference_on_cpu else 'XPU'}")
+            print(
+                f"Input dtypes: {[str(inp.dtype) for inp in torch_inputs]}; "
+                f"parameter dtypes: {sorted({str(p.dtype) for p in torch_model.parameters()})}"
+            )
+            dump_verification_failure(
+                result, result_ref, atol=float(atol), rtol=float(rtol)
+            )
 
     # re-generate random, nonzero weights for performance measurement
     for param in torch_model.parameters():
@@ -772,6 +932,9 @@ def lower_and_execute_benchmark(
         # replace zeros with random +/-0.5
         rnd_sign = torch.sign(torch.rand_like(param.data) - 0.5)
         param.data[param.data == 0] = 0.5 * rnd_sign[param.data == 0]
+
+    for index in set(power_of_two_inputs or []):
+        torch_inputs[index].normal_()
 
     # benchmark
     if verbose > 0:
@@ -941,6 +1104,21 @@ def parser_cli_args():
         help="Number of warmup runs (default: 500)",
     )
     parser.add_argument(
+        "--identity-weights",
+        action="store_true",
+        help="Verify with rectangular identity Linear weights and zero biases. "
+        "Timing still uses dense random weights.",
+    )
+    parser.add_argument(
+        "--power-of-two-inputs",
+        type=int,
+        nargs="+",
+        metavar="INDEX",
+        help="Zero-based model input indices to simplify for verification: round "
+        "nonzero magnitudes down to powers of two, preserving signs and zeros. "
+        "Selected inputs are randomized again for timing.",
+    )
+    parser.add_argument(
         "--compute-reference-on-cpu",
         action="store_true",
         help="Compute the reference result on CPU instead of the device.",
@@ -1019,6 +1197,8 @@ if __name__ == "__main__":
                 nruns=args.nruns,
                 nwarmup=args.nwarmup,
                 compute_reference_on_cpu=args.compute_reference_on_cpu,
+                identity_weights=args.identity_weights,
+                power_of_two_inputs=args.power_of_two_inputs,
                 verbose=args.verbose,
                 stop_at_stage=stop_at_stage,
                 dump_parameters=args.dump_parameters,
