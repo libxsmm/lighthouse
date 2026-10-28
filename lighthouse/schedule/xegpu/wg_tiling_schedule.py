@@ -12,20 +12,63 @@ from lighthouse.schedule import schedule_boilerplate
 from lighthouse.dialects.transform import transform_ext
 from .attention_fusion import transform_to_flash_attention
 from .lowering_common import get_payload_func
+from lighthouse.dialects.transform.transform_ext.utils.subgraph_analysis import (
+    SUBGRAPH_ANCHOR_ATTR_NAME,
+    SUBGRAPH_KIND_ATTR_NAME,
+)
 
 
-def apply_gemm_tiling(
+def _subgraph_anchors(func: ir.Value, kind: str) -> ir.Value:
+    """Match the anchors of the subgraphs of `kind` tagged by `tag_subgraphs`."""
+    return match(
+        func,
+        op_attrs={
+            SUBGRAPH_KIND_ATTR_NAME: ir.StringAttr.get(kind),
+            SUBGRAPH_ANCHOR_ATTR_NAME: ir.UnitAttr.get(),
+        },
+    )
+
+
+def _tile_subgraph(
+    anchor: ir.Value,
+    producers: ir.Value,
+    consumers: ir.Value,
+    wg_tile: list | ir.Value,
+) -> ir.Value:
+    """Tile a subgraph anchor into an scf.forall and fuse the other ops of the
+    subgraph into it: producers backward, consumers forward. Returns the loop."""
+    anytype = transform.AnyOpType.get()
+    _, wg_loop = structured.TileUsingForallOp(anchor, tile_sizes=wg_tile).results
+    _, wg_loop = structured.structured_fuse_into_containing_op(
+        anytype, anytype, producer_op=producers, containing_op=wg_loop
+    )
+    return transform_ext.fuse_forall_epilogue(wg_loop, consumers)
+
+
+def apply_subgraph_tiling(
     func: ir.Operation,
     force_wg_tile: list[int] | None = None,
     force_k_tile: int | None = None,
     device: str | None = None,
 ) -> ir.Operation:
-    """Apply GEMM tiling to the given function."""
+    """Partition the function into GEMM and elementwise subgraphs and tile each
+    subgraph into its own workgroup-parallel scf.forall, i.e. its own kernel.
+
+    GEMM subgraphs are matched first and claim their epilogue chains; the
+    remaining elementwise ops form separate subgraphs. Fails silenceably if the
+    function has no matmul or if some linalg op is left unpartitioned.
+    """
 
     matmul_ops = lh_transform.match_op(func, "linalg.matmul")
     # Ensure lowering fails if no matmul ops exist.
     transform_ext.extract_handle(matmul_ops, 0, silenceable=True)
-    with lh_transform.foreach(matmul_ops) as matmul_op:
+    func = transform_ext.tag_subgraphs(func, kinds=["gemm", "elementwise"])
+
+    with lh_transform.foreach(_subgraph_anchors(func, "gemm")) as anchor:
+        producers, consumers = transform_ext.get_subgraph_ops(anchor)
+        matmul_op = transform_ext.filter_by_name(
+            transform.merge_handles([anchor, producers]), "linalg.matmul"
+        )
         params = transform_ext.infer_xegpu_gemm_params(
             matmul_op,
             force_wg_tile=force_wg_tile,
@@ -35,22 +78,8 @@ def apply_gemm_tiling(
         wg_m = transform_ext.get_param_dict_entry(params, "wg_m")
         wg_n = transform_ext.get_param_dict_entry(params, "wg_n")
         k_tile = transform_ext.get_param_dict_entry(params, "k_tile")
-        wg_tile = [wg_m, wg_n]
 
-        # find the last tileable consumer of the matmul
-        consumers = transform_ext.get_tileable_consumers(matmul_op)
-        leaf_consumer_op = transform_ext.extract_handle(consumers, -1, silenceable=True)
-
-        # wg tiling
-        _, [wg_loop], _ = lh_transform.tile(
-            leaf_consumer_op,
-            tile_sizes=wg_tile,
-            fuse_producers=True,
-            use_forall=True,
-            apply_cleanup=False,
-        )
-        transform.apply_dce(wg_loop)
-        wg_loop = transform_ext.fuse_forall_epilogue(wg_loop)
+        wg_loop = _tile_subgraph(anchor, producers, consumers, [wg_m, wg_n])
 
         # k loop tiling
         wg_matmul = match(wg_loop, ops={"linalg.matmul"})
@@ -61,6 +90,17 @@ def apply_gemm_tiling(
         )
         lh_transform.cleanup(wg_loop)
         transform.yield_()
+    transform.apply_dce(func)
+
+    with lh_transform.foreach(_subgraph_anchors(func, "elementwise")) as anchor:
+        producers, consumers = transform_ext.get_subgraph_ops(anchor)
+        wg_tile = transform_ext.infer_xegpu_elementwise_params(anchor)
+        wg_loop = _tile_subgraph(anchor, producers, consumers, wg_tile)
+        lh_transform.cleanup(wg_loop)
+        transform.yield_()
+
+    transform_ext.clear_subgraph_tags(func)
+    func = transform_ext.split_concat_output(func)
     lh_transform.cleanup(func)
     return func
 
@@ -304,7 +344,7 @@ def wg_tiling_schedule(
             payload_func, num_alternatives=4, result_types=[payload_func.type]
         )
         with alt.region(0) as func:
-            func = apply_gemm_tiling(
+            func = apply_subgraph_tiling(
                 func,
                 force_wg_tile=wg_tile,
                 force_k_tile=k_tile,
