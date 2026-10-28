@@ -453,7 +453,7 @@ def analyze_and_annotate_gpu_func(
 ):
     """
     Analyzes a GPU function operation and annotates it with layout information
-    for the contained DPAS operations.
+    for attention, GEMM, reduction, or single-subgroup elementwise kernels.
 
     Args:
         gpu_func_op (ir.Operation): The GPU function operation to analyze and annotate.
@@ -465,7 +465,7 @@ def analyze_and_annotate_gpu_func(
     """
 
     alt = lh_transform.alternatives(
-        gpu_func_op, num_alternatives=4, result_types=[gpu_func_op.type]
+        gpu_func_op, num_alternatives=5, result_types=[gpu_func_op.type]
     )
     with alt.region(0) as gpu_func:
         # Attention layer case; has both dpas and reduction ops
@@ -509,6 +509,12 @@ def analyze_and_annotate_gpu_func(
         annotate_reduction(gpu_func, anchor_op, force_sg_tile=sg_tile)
         transform.yield_([gpu_func])
     with alt.region(3) as gpu_func:
+        transform_ext.annotate_elementwise_layouts(gpu_func)
+        transform_ext.annotate_epilogue_broadcasts(
+            lh_transform.match_op(gpu_func, "xegpu.store_nd")
+        )
+        transform.yield_([gpu_func])
+    with alt.region(4) as gpu_func:
         # Exhausting all real alternatives is a hard error, not a recoverable
         # silenceable failure.
         transform_ext.emit_definite_failure(
