@@ -55,13 +55,10 @@ def apply_subgraph_tiling(
     subgraph into its own workgroup-parallel scf.forall, i.e. its own kernel.
 
     GEMM subgraphs are matched first and claim their epilogue chains; the
-    remaining elementwise ops form separate subgraphs. Fails silenceably if the
-    function has no matmul or if some linalg op is left unpartitioned.
+    remaining elementwise ops form separate subgraphs. Pure elementwise graphs
+    are also supported. Fails silenceably if a linalg op is left unpartitioned.
     """
 
-    matmul_ops = lh_transform.match_op(func, "linalg.matmul")
-    # Ensure lowering fails if no matmul ops exist.
-    transform_ext.extract_handle(matmul_ops, 0, silenceable=True)
     func = transform_ext.tag_subgraphs(func, kinds=["gemm", "elementwise"])
 
     with lh_transform.foreach(_subgraph_anchors(func, "gemm")) as anchor:
