@@ -1,5 +1,7 @@
 """Analysis helpers for inferring matmul shape and XeGPU parameters."""
 
+import math
+
 from mlir import ir
 from mlir.dialects import memref, vector
 
@@ -49,9 +51,28 @@ def _matmul_shape_and_transpose(
 
     dim_size: dict[int, int] = {}
     for dims, shape in ((a_dims, a_shape), (b_dims, b_shape)):
-        for i, d in enumerate(dims):
-            if d is not None:
-                dim_size[d] = shape[i]
+        if len(shape) == len(dims):
+            for i, d in enumerate(dims):
+                if d is not None:
+                    dim_size[d] = shape[i]
+            continue
+
+        # A vector.shape_cast may collapse several global dimensions into one
+        # parallel iteration dimension (e.g. batch and sequence into M). The
+        # reduction dimension remains the first or last physical dimension,
+        # according to its position in the contraction indexing map.
+        if len(shape) < len(dims) or len(dims) != 2:
+            raise ValueError(
+                "Could not map vector.contract indexing dimensions to operand "
+                f"shape {shape}"
+            )
+        reduction_position = dims.index(k_dim)
+        reduction_axis = 0 if reduction_position == 0 else len(shape) - 1
+        dim_size[k_dim] = shape[reduction_axis]
+        parallel_dim = next(d for d in dims if d != k_dim)
+        dim_size[parallel_dim] = math.prod(
+            extent for i, extent in enumerate(shape) if i != reduction_axis
+        )
 
     shape = (dim_size[m_dim], dim_size[n_dim], dim_size[k_dim])
     transpose_a = a_dims == [k_dim, m_dim]
