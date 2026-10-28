@@ -211,15 +211,7 @@ def annotate_gemm(
         transform.annotate(store, "layout", param=store_layout)
         transform.yield_()
 
-    # annotate the 1d load of the broadcast op with a slice layout
-    # NOTE assumes that xegpu.load is followed by vector.broadcast
-    maybe_bcast_load = lh_transform.match_op(gpu_func_op, "xegpu.load")
-    load_user = transform.get_consumers_of_result(anytype, maybe_bcast_load, 0)
-    bcast_ops = transform.select(anytype, load_user, "vector.broadcast")
-    with lh_transform.foreach(bcast_ops) as bcast_op:
-        bcast_load = xegpu.get_load_op(transform.get_operand(anyvalue, bcast_op, [0]))
-        xegpu.set_anchor_layout(bcast_load, index=0, **output_layout, slice_dims=[0])
-        transform.yield_()
+    transform_ext.annotate_epilogue_broadcasts(store_op_c)
 
     lh_transform.cleanup(gpu_func_op)
 
