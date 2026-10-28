@@ -371,6 +371,17 @@ def wg_tiling_schedule(
             transform.yield_([func])
         payload_func = alt.results[0]
 
+        # Fold unit dimensions.
+        # Generalize named ops so unit dims in transpose ops are folded too.
+        structured.structured_generalize(
+            transform.AnyOpType.get(),
+            lh_transform.match_op(payload_func, "linalg.transpose").results[0],
+        )
+        with ir.InsertionPoint(transform.apply_patterns(payload_func).patterns):
+            structured.apply_patterns_linalg_fold_unit_extent_dims_via_slices()
+            tensor.apply_patterns_tensor_reassociative_reshape_folding()
+        lh_transform.cleanup(payload_func)
+
         transform.yield_()
 
     return schedule
