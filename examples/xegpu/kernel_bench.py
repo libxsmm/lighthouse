@@ -520,10 +520,14 @@ def infer_params_and_lower(
             for k, v in param_dict.items():
                 print(f"  {k}: {v}")
 
+    # GEMM tile overrides must not leak into a separate normalization kernel.
+    mixed_reduction_gemm = bool(matmuls) and any(
+        layer["kind"] == "reduction" for layer in func_metadata["layers"]
+    )
     lowered_mod = lower_to_llvm(
         mod=mod,
         schedule_kind=schedule_kind,
-        schedule_params=schedule_params,
+        schedule_params=None if mixed_reduction_gemm else schedule_params,
         device="B70" if schedule_kind == "mlp" else None,
         stop_at_stage=stop_at_stage,
         benchmark=benchmark,
@@ -543,7 +547,7 @@ def infer_params_and_lower(
 def lower_to_llvm(
     mod: ir.Module,
     schedule_kind: str,
-    schedule_params: ScheduleParameters,
+    schedule_params: ScheduleParameters | None,
     device: str | None,
     stop_at_stage: str | None,
     benchmark: bool,
@@ -552,8 +556,12 @@ def lower_to_llvm(
     """Lower payload module to LLVM using the specified schedule and parameters."""
     Runner.make_function_callable(mod, payload_func_name)
     if schedule_kind in ("mlp", "reduction", "attention"):
-        parameters = schedule_params[0]
-        if schedule_kind == "mlp" and len(schedule_params) > 1:
+        parameters = schedule_params[0] if schedule_params is not None else None
+        if (
+            schedule_kind == "mlp"
+            and schedule_params is not None
+            and len(schedule_params) > 1
+        ):
             # TODO fix parameter propagation for multiple layers
             parameters = None
         pipeline = xegpu.get_xegpu_pipeline(
