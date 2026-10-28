@@ -8,84 +8,64 @@
 # REQUIRES: torch, torch_mlir
 
 # CHECK-LABEL: func.func private @main(
-# CHECK-COUNT-2: linalg.matmul
+# CHECK: linalg.matmul
+# CHECK-NOT: linalg.matmul
 # CHECK: tensor.extract_slice
 # CHECK: arith.negf
 # CHECK: arith.mulf
 # CHECK: arith.addf
 # CHECK: return
 
-# Projections and RoPE are tiled into separate workgroup loops (kernels).
+# The K projection and RoPE are tiled into separate workgroup loops (kernels).
 # TILED-LABEL: func.func private @main(
-# TILED: scf.forall {{.*}} -> (tensor<2048x2048xbf16>)
-# TILED: scf.for
-# TILED: linalg.matmul
-# TILED: arith.truncf
 # TILED: scf.forall {{.*}} -> (tensor<2048x512xbf16>)
 # TILED: scf.for
 # TILED: linalg.matmul
 # TILED: arith.truncf
-# TILED: scf.forall {{.*}} -> (tensor<4x32x512x64xbf16>)
-# TILED-NOT: linalg.matmul
-# TILED: linalg.transpose
-# TILED: arith.negf
-# TILED: arith.addf
-# TILED-COUNT-2: tensor.insert_slice
 # TILED: scf.forall {{.*}} -> (tensor<4x8x512x64xbf16>)
 # TILED-NOT: linalg.matmul
-# TILED: linalg.transpose
+# TILED: tensor<128x32xbf16>
 # TILED: arith.negf
 # TILED: arith.addf
 # TILED-COUNT-2: tensor.insert_slice
 # TILED: return
 
 # VECTOR-LABEL: func.func private @main(
-# VECTOR-COUNT-2: arith.truncf
-# VECTOR: scf.forall {{.*}} -> (tensor<4x32x512x64xbf16>)
-# VECTOR-COUNT-2: vector.transfer_write {{.*}}vector<128x32xbf16>
-# VECTOR-NOT: vector.transfer_write
+# VECTOR: vector.transfer_read {{.*}}tensor<4x512x2048xbf16>, vector<128x16xbf16>
+# VECTOR-NEXT: {{.*}}vector.contract
+# VECTOR: arith.truncf
 # VECTOR: scf.forall {{.*}} -> (tensor<4x8x512x64xbf16>)
+# VECTOR: vector.transfer_read {{.*}}tensor<4x512x8x64xbf16>, vector<128x32xbf16>
+# VECTOR-NOT: vector.shape_cast
 # VECTOR-COUNT-2: vector.transfer_write {{.*}}vector<128x32xbf16>
 # VECTOR-NOT: vector.transfer_write
 # VECTOR: return
 
-# Only the projection results passed between kernels are allocated.
+# Only the projection result passed between kernels is allocated.
 # BUFFER-LABEL: func.func private @main(
-# BUFFER: gpu.alloc () : memref<2048x2048xbf16>
-# BUFFER: scf.forall
 # BUFFER: gpu.alloc () : memref<2048x512xbf16>
-# BUFFER-COUNT-3: scf.forall
+# BUFFER-NOT: gpu.alloc
+# BUFFER-COUNT-2: scf.forall
 # BUFFER: return
 
-# OUTLINE-COUNT-2: gpu.func @main_kernel{{.*}}known_block_size = array<i32: 512, 1, 1>
-# OUTLINE-COUNT-2: gpu.func @main_kernel{{.*}}known_block_size = array<i32: 16, 1, 1>
+# OUTLINE: gpu.func @main_kernel{{.*}}known_block_size = array<i32: 512, 1, 1>
+# OUTLINE: gpu.func @main_kernel{{.*}}known_block_size = array<i32: 16, 1, 1>
+# OUTLINE-NOT: gpu.func
 
-# XEGPU-COUNT-2: gpu.alloc
+# XEGPU: gpu.alloc
 # XEGPU-NOT: gpu.alloc
-# XEGPU-COUNT-2: xegpu.dpas
-# XEGPU: gpu.func @main_kernel{{.*}}memref<4x32x512x64xbf16>
-# XEGPU-NOT: gpu.alloc
-# XEGPU-COUNT-2: xegpu.store_nd {{.*}}vector<128x32xbf16>
+# XEGPU: xegpu.dpas
 # XEGPU: gpu.func @main_kernel{{.*}}memref<4x8x512x64xbf16>
 # XEGPU-NOT: gpu.alloc
 # XEGPU-COUNT-2: xegpu.store_nd {{.*}}vector<128x32xbf16>
 # XEGPU-NOT: gpu.alloc
 
-# WG-COUNT-2: xegpu.dpas
-# WG-LABEL: gpu.func @main_kernel{{.*}}memref<4x32x512x64xbf16>
-# WG-NOT: gpu.alloc
-# WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1, 1], sg_data = [128, 1, 32]>
-# WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1], sg_data = [128, 32]>
-# WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1, 1], sg_data = [128, 1, 32]>
-# WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1], sg_data = [128, 32]>
-# WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1], sg_data = [128, 32]>
-# WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1], sg_data = [128, 32]>
-# WG-COUNT-2: xegpu.store_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1], sg_data = [128, 32]>
+# WG: xegpu.dpas
 # WG-LABEL: gpu.func @main_kernel{{.*}}memref<4x8x512x64xbf16>
 # WG-NOT: gpu.alloc
-# WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1, 1], sg_data = [128, 1, 32]>
 # WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1], sg_data = [128, 32]>
-# WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1, 1], sg_data = [128, 1, 32]>
+# WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1], sg_data = [128, 32]>
+# WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1], sg_data = [128, 32]>
 # WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1], sg_data = [128, 32]>
 # WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1], sg_data = [128, 32]>
 # WG: xegpu.load_nd {{.*}}layout = #xegpu.layout<sg_layout = [1, 1], sg_data = [128, 32]>
@@ -101,34 +81,31 @@ from llama_rope import get_rope_tables, rotate_half
 batch_size = 4
 n_ctx = 512
 dim = 2048
-num_heads = 32
 num_kv_heads = 8
 d_head = 64
 
 
 class Model(nn.Module):
-    """Llama 3.2 1B Q/K projections followed by RoPE, for epilogue fusion.
+    """Llama 3.2 1B K projection followed by a separate RoPE kernel.
 
     The input x is already normalized: [batch, sequence, dim]. Precomputed
     cos/sin tables [sequence, d_head] are shared across the batch. Returns
-    rotated Q [batch, num_heads, sequence, d_head] and K [batch, num_kv_heads,
-    sequence, d_head]. V, RMSNorm, and attention are excluded.
+    rotated K [batch, num_kv_heads, sequence, d_head]. Q, V, RMSNorm, and
+    attention are excluded to keep a single result tensor.
     """
 
     def __init__(self):
         super().__init__()
-        self.q_proj = nn.Linear(dim, num_heads * d_head, bias=False)
         self.k_proj = nn.Linear(dim, num_kv_heads * d_head, bias=False)
 
     def forward(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         batch, sequence, _ = x.shape
-        q = self.q_proj(x).view(batch, sequence, num_heads, d_head).transpose(1, 2)
         k = self.k_proj(x).view(batch, sequence, num_kv_heads, d_head).transpose(1, 2)
         cos = cos[None, None, :, :]
         sin = sin[None, None, :, :]
-        return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+        return k * cos + rotate_half(k) * sin
 
 
 def get_inputs():
