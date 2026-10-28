@@ -5,6 +5,7 @@
 # RUN: %PYTHON %S/kernel_bench.py --input %s --dump-kernel gpu-outlining | FileCheck %s --check-prefix=OUTLINE
 # RUN: %PYTHON %S/kernel_bench.py --input %s --dump-kernel xegpu-initial | FileCheck %s --check-prefix=XEGPU --implicit-check-not=vector.extract_strided_slice --implicit-check-not=vector.insert_strided_slice --implicit-check-not=memref.copy
 # RUN: %PYTHON %S/kernel_bench.py --input %s --dump-kernel xegpu-wg | FileCheck %s --check-prefix=WG --implicit-check-not=vector.extract_strided_slice --implicit-check-not=vector.insert_strided_slice --implicit-check-not=memref.copy
+# RUN: %PYTHON %S/kernel_bench.py --input %s --identity-weights --power-of-two-inputs 0 --dump-kernel xegpu-wg | FileCheck %s --check-prefix=WG --implicit-check-not=vector.extract_strided_slice --implicit-check-not=vector.insert_strided_slice --implicit-check-not=memref.copy
 # REQUIRES: torch, torch_mlir
 
 # CHECK-LABEL: func.func private @main(
