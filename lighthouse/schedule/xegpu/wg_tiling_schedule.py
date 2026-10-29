@@ -63,6 +63,8 @@ def apply_subgraph_tiling(
     are also supported. Fails silenceably if a linalg op is left unpartitioned.
     """
 
+    with ir.InsertionPoint(transform.apply_patterns(func).patterns):
+        structured.apply_patterns_linalg_swap_extract_slice_with_fill()
     func = transform_ext.tag_subgraphs(
         func, kinds=["attention", "reduction", "gemm", "elementwise"]
     )
@@ -77,12 +79,19 @@ def apply_subgraph_tiling(
         wg_tile, _, reduction_tile = transform_ext.infer_xegpu_reduction_params(
             reduction
         )
-        _, [wg_loop], _ = lh_transform.tile(
-            anchor,
-            tile_sizes=wg_tile,
-            fuse_producers=True,
-            use_forall=True,
-            apply_cleanup=False,
+        id = transform_ext.get_named_attribute(anchor, SUBGRAPH_ID_ATTR_NAME)
+        producers = transform_ext.filter_by_name(
+            transform_ext.trace_producers(
+                anchor, scope=func, subgraph=id, order="reverse-topological"
+            ),
+            ["linalg.generic", "linalg.fill", "linalg.transpose"],
+        )
+        _, wg_loop = structured.TileUsingForallOp(anchor, tile_sizes=wg_tile).results
+        _, wg_loop = structured.structured_fuse_into_containing_op(
+            transform.AnyOpType.get(),
+            transform.AnyOpType.get(),
+            producer_op=producers,
+            containing_op=wg_loop,
         )
         lh_transform.cleanup(wg_loop)
         wg_loop = transform_ext.fuse_elementwise_region(wg_loop)
@@ -153,7 +162,9 @@ def _tile_reduction_body(wg_loop, reduction_tile):
 
     def fuse_producers(target, loop):
         producers = transform_ext.filter_by_name(
-            transform_ext.filter_elementwise(transform_ext.trace_producers(target)),
+            transform_ext.filter_elementwise(
+                transform_ext.trace_producers(target, scope=wg_loop)
+            ),
             "linalg.generic",
         )
         _, loop = structured.structured_fuse_into_containing_op(
