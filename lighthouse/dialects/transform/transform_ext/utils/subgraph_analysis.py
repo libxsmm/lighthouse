@@ -29,6 +29,7 @@ from lighthouse.dialects.transform.transform_ext.ops.filter_contraction_ops impo
 SUBGRAPH_KIND_ATTR_NAME = "transform_ext.subgraph_kind"
 SUBGRAPH_ID_ATTR_NAME = "transform_ext.subgraph_id"
 SUBGRAPH_ANCHOR_ATTR_NAME = "transform_ext.subgraph_anchor"
+SUBGRAPH_EPILOGUE_ATTR_NAME = "transform_ext.subgraph_epilogue"
 
 _DATA_MOVEMENT_OPS = (
     tensor.ExpandShapeOp,
@@ -50,12 +51,17 @@ def is_tagged(op: ir.Operation | ir.OpView) -> bool:
 
 
 def tag(ops: Iterable, anchor, kind: str, id: int) -> None:
+    ops = [opview(op).operation for op in ops]
+    anchor = opview(anchor).operation
     i64 = ir.IntegerType.get_signless(64)
     for op in ops:
         attrs = opview(op).operation.attributes
         attrs[SUBGRAPH_KIND_ATTR_NAME] = ir.StringAttr.get(kind)
         attrs[SUBGRAPH_ID_ATTR_NAME] = ir.IntegerAttr.get(i64, id)
-    opview(anchor).operation.attributes[SUBGRAPH_ANCHOR_ATTR_NAME] = ir.UnitAttr.get()
+    anchor.attributes[SUBGRAPH_ANCHOR_ATTR_NAME] = ir.UnitAttr.get()
+    if kind == "attention":
+        for consumer in _forward_closure(anchor, ops)[1:]:
+            consumer.attributes[SUBGRAPH_EPILOGUE_ATTR_NAME] = ir.UnitAttr.get()
 
 
 def clear_tags(op: ir.Operation | ir.OpView) -> None:
@@ -65,6 +71,7 @@ def clear_tags(op: ir.Operation | ir.OpView) -> None:
             SUBGRAPH_KIND_ATTR_NAME,
             SUBGRAPH_ID_ATTR_NAME,
             SUBGRAPH_ANCHOR_ATTR_NAME,
+            SUBGRAPH_EPILOGUE_ATTR_NAME,
         ):
             if name in attrs:
                 del attrs[name]
@@ -372,7 +379,13 @@ def _match_attention(root, block_ops):
     for i, member in enumerate(members):
         if member != sink and any(u not in members for u in _users(member)):
             members[i] = _clone_for(member, members)
-    return [(members, sink)]
+    anchor = sink
+    while anchor.name in movement:
+        source = _producer(anchor.operands[0])
+        if source is None or source not in members:
+            break
+        anchor = source
+    return [(members, anchor)]
 
 
 SUBGRAPH_MATCHERS: dict[str, Callable] = {
