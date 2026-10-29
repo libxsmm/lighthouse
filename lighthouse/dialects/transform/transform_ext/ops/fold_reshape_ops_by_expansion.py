@@ -8,6 +8,11 @@ from mlir.dialects.transform import DiagnosedSilenceableFailure
 
 from lighthouse.dialects.transform.transform_ext import TransformExtensionDialect
 from lighthouse.utils.mlir import indexing_maps, opview
+from lighthouse.dialects.transform.transform_ext.utils.subgraph_analysis import (
+    SUBGRAPH_ID_ATTR_NAME,
+    SUBGRAPH_KIND_ATTR_NAME,
+    subgraph_id,
+)
 
 
 def _producer(value):
@@ -70,7 +75,7 @@ def _plan(generic, operand_number, reshape):
     return maps, shapes, loop_groups, num_loops
 
 
-def _expand(value, shape, groups):
+def _expand(value, shape, groups, membership):
     ty = value.type
     if not isinstance(ty, ir.RankedTensorType) or list(ty.shape) == shape:
         return value
@@ -82,11 +87,19 @@ def _expand(value, shape, groups):
         and _groups(producer) == groups
     ):
         return producer.src
-    return tensor.ExpandShapeOp(expanded_type, value, groups, [], shape).result
+    expanded = tensor.ExpandShapeOp(expanded_type, value, groups, [], shape)
+    for name, attr in membership.items():
+        expanded.attributes[name] = attr
+    return expanded.result
 
 
 def _rewrite(generic, reshape, plan, rewriter):
     maps, shapes, loop_groups, num_loops = plan
+    membership = {
+        name: generic.attributes[name]
+        for name in (SUBGRAPH_ID_ATTR_NAME, SUBGRAPH_KIND_ATTR_NAME)
+        if name in generic.attributes
+    }
     with generic.location, ir.InsertionPoint(generic):
         operands, new_maps, reassociations = [], [], []
         for value, m in zip(generic.operands, maps):
@@ -98,7 +111,7 @@ def _rewrite(generic, reshape, plan, rewriter):
                 exprs.extend(
                     ir.AffineExpr.get_dim(d) for d in loop_groups[expr.position]
                 )
-            operands.append(_expand(value, shape, groups))
+            operands.append(_expand(value, shape, groups, membership))
             new_maps.append(ir.AffineMapAttr.get(ir.AffineMap.get(num_loops, 0, exprs)))
             reassociations.append(groups)
 
@@ -133,11 +146,12 @@ def _rewrite(generic, reshape, plan, rewriter):
             if old.type == new.type:
                 replacements.append(new)
             else:
-                replacements.append(
-                    tensor.CollapseShapeOp(
-                        old.type, new, reassociations[len(generic.inputs) + i]
-                    ).result
+                collapsed = tensor.CollapseShapeOp(
+                    old.type, new, reassociations[len(generic.inputs) + i]
                 )
+                for name, value in membership.items():
+                    collapsed.attributes[name] = value
+                replacements.append(collapsed.result)
 
     if isinstance(reshape, tensor.ExpandShapeOp):
         result_number = reshape.src.result_number
@@ -145,11 +159,13 @@ def _rewrite(generic, reshape, plan, rewriter):
     rewriter.replace_op(generic, replacements)
 
 
-def _fold_one(root, rewriter):
+def _fold_one(root, rewriter, ids=None):
     candidates = []
 
     def visit(operation):
-        if operation.name in ("linalg.generic", "tensor.expand_shape"):
+        if operation.name in ("linalg.generic", "tensor.expand_shape") and (
+            ids is None or subgraph_id(operation) in ids
+        ):
             candidates.append(operation.opview)
         return ir.WalkResult.ADVANCE
 
@@ -195,9 +211,12 @@ class FoldReshapeOpsByExpansionOp(
 
     Consumes the container handle and invalidates nested handles. Reacquire
     payload handles through the returned container after this transform.
+    An optional `subgraph` parameter restricts rewriting to those membership
+    ids. New reshapes inherit membership without claiming upstream producers.
     """
 
     target: ext.Operand[transform.AnyOpType]
+    subgraph: ext.Operand[transform.AnyParamType] | None = None
     result: ext.Result[transform.AnyOpType[()]] = ext.infer_result()
 
     @classmethod
@@ -217,7 +236,14 @@ class FoldReshapeOpsByExpansionOp(
                     "fold_reshape_ops_by_expansion expects one func.func or builtin.module"
                 )
                 return DiagnosedSilenceableFailure.SilenceableFailure
-            while _fold_one(targets[0], rewriter):
+            ids = None
+            if op.subgraph is not None:
+                params = state.get_params(op.subgraph)
+                if any(not isinstance(id, ir.IntegerAttr) for id in params):
+                    op.operation.location.emit_error("expected integer subgraph ids")
+                    return DiagnosedSilenceableFailure.SilenceableFailure
+                ids = {ir.IntegerAttr(id).value for id in params}
+            while _fold_one(targets[0], rewriter, ids):
                 pass
             results.set_ops(op.result, targets)
             return DiagnosedSilenceableFailure.Success
@@ -230,7 +256,8 @@ class FoldReshapeOpsByExpansionOp(
         @staticmethod
         def get_effects(op):
             return (
-                transform.consumes_handle(op.op_operands)
+                transform.consumes_handle(op.op_operands[:1])
+                + transform.only_reads_handle(op.op_operands[1:])
                 + transform.produces_handle(op.results)
                 + transform.modifies_payload()
             )
@@ -238,6 +265,7 @@ class FoldReshapeOpsByExpansionOp(
 
 def fold_reshape_ops_by_expansion(
     target: ir.Value[transform.AnyOpType],
+    subgraph: ir.Value[transform.AnyParamType] | None = None,
 ) -> ir.Value[transform.AnyOpType]:
     """Expand generic iteration spaces across static tensor reshape boundaries."""
-    return FoldReshapeOpsByExpansionOp(target=target).result
+    return FoldReshapeOpsByExpansionOp(target=target, subgraph=subgraph).result
