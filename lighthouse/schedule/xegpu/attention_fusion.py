@@ -8,7 +8,9 @@ from lighthouse.pipeline.helper import match, apply_registered_pass
 from lighthouse.dialects.transform import transform_ext
 
 
-def transform_to_flash_attention(anytype, func, reduction_tile) -> ir.Operation:
+def transform_to_flash_attention(
+    anytype, func, reduction_tile, *, remove_dead_values=True
+) -> ir.Operation:
     """Fold the attention chain into the tiled row-max loop.
 
     After generalization: ``s = Q@K^T * scale``, ``m = max(s)``,
@@ -38,7 +40,7 @@ def transform_to_flash_attention(anytype, func, reduction_tile) -> ir.Operation:
     )
     max_op = transform.get_parent_op(anytype, arith_max_op, op_name="linalg.generic")
     # Keep track of the producers of the max reduction.
-    max_producers = transform_ext.trace_producers(max_op)
+    max_producers = transform_ext.trace_producers(max_op, scope=func)
     max_producers = transform_ext.filter_by_name(
         max_producers,
         ["linalg.generic", "linalg.transpose"],
@@ -78,7 +80,7 @@ def transform_to_flash_attention(anytype, func, reduction_tile) -> ir.Operation:
         anytype,
         transform.get_operand(anyvalue, pv_op, [1]),
     )
-    v_producers = transform_ext.trace_producers(v_op)
+    v_producers = transform_ext.trace_producers(v_op, scope=func)
     v_producers = transform.merge_handles([v_op, v_producers])
     v_producers = transform_ext.filter_by_name(
         v_producers,
@@ -95,7 +97,7 @@ def transform_to_flash_attention(anytype, func, reduction_tile) -> ir.Operation:
 
     def fuse_fill_producers_to_loop(target, parent_loop):
         """Fuses all elementwise producer ops of `target` into `parent_loop`."""
-        producers = transform_ext.trace_producers(target)
+        producers = transform_ext.trace_producers(target, scope=func)
         elemwise_producers = transform_ext.filter_elementwise(producers)
         elemwise_producers = transform_ext.filter_by_name(
             elemwise_producers,
@@ -111,7 +113,9 @@ def transform_to_flash_attention(anytype, func, reduction_tile) -> ir.Operation:
 
     # Fuse all V/max_op producers into the reduction loop.
     # TODO Implement a generic producer fuser.
-    all_producers = transform.merge_handles([v_producers, max_producers])
+    all_producers = transform.merge_handles(
+        [v_producers, max_producers], deduplicate=True
+    )
     with lh_transform.foreach(all_producers) as producer:
         _, reduction_loop = structured.structured_fuse_into_containing_op(
             anytype,
@@ -138,7 +142,8 @@ def transform_to_flash_attention(anytype, func, reduction_tile) -> ir.Operation:
     fuse_fill_producers_to_loop(max_op, reduction_loop)
 
     transform.apply_cse(func)
-    func = apply_registered_pass(func, "remove-dead-values")
+    if remove_dead_values:
+        func = apply_registered_pass(func, "remove-dead-values")
     lh_transform.cleanup(func)
 
     # Clean up, e.g. remove singleton batch dims to get 2D matmul ops.
