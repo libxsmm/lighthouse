@@ -11,6 +11,7 @@ from lighthouse.utils.mlir import indexing_maps, opview
 from lighthouse.dialects.transform.transform_ext.utils.subgraph_analysis import (
     SUBGRAPH_ID_ATTR_NAME,
     SUBGRAPH_KIND_ATTR_NAME,
+    SUBGRAPH_EPILOGUE_ATTR_NAME,
     subgraph_id,
 )
 
@@ -151,6 +152,13 @@ def _rewrite(generic, reshape, plan, rewriter):
                 )
                 for name, value in membership.items():
                     collapsed.attributes[name] = value
+                if any(
+                    SUBGRAPH_EPILOGUE_ATTR_NAME in use.owner.attributes
+                    for use in old.uses
+                ):
+                    collapsed.attributes[SUBGRAPH_EPILOGUE_ATTR_NAME] = (
+                        ir.UnitAttr.get()
+                    )
                 replacements.append(collapsed.result)
 
     if isinstance(reshape, tensor.ExpandShapeOp):
@@ -164,7 +172,11 @@ def _fold_one(root, rewriter, ids=None):
 
     def visit(operation):
         if operation.name in ("linalg.generic", "tensor.expand_shape") and (
-            ids is None or subgraph_id(operation) in ids
+            ids is None
+            or (
+                subgraph_id(operation) in ids
+                and SUBGRAPH_EPILOGUE_ATTR_NAME not in operation.attributes
+            )
         ):
             candidates.append(operation.opview)
         return ir.WalkResult.ADVANCE
