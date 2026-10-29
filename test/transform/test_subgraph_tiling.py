@@ -273,6 +273,56 @@ def test_mixed_reduction():
 # CHECK-NEXT: Shared reduction is materialized once before both GEMM consumers
 
 
+def test_shared_normalization_input():
+    source = (
+        NORMALIZED.replace(
+            "%r2: memref<4x64x256xf32>)",
+            "%r2: memref<4x64x256xf32>, %residual_out: memref<256x128xf32>)",
+        )
+        .replace(
+            "  %ne = tensor.empty()",
+            """  %residual_empty = tensor.empty() : tensor<256x128xf32>
+  %residual = linalg.generic {indexing_maps=[#id2,#id2,#id2],
+      iterator_types=["parallel","parallel"]}
+    ins(%x, %x : tensor<256x128xf32>, tensor<256x128xf32>)
+    outs(%residual_empty : tensor<256x128xf32>) {
+  ^bb0(%a: f32, %b: f32, %o: f32):
+    %sum = arith.addf %a, %b : f32
+    linalg.yield %sum : f32
+  } -> tensor<256x128xf32>
+  bufferization.materialize_in_destination %residual in restrict writable %residual_out
+    : (tensor<256x128xf32>, memref<256x128xf32>) -> ()
+  %ne = tensor.empty()""",
+        )
+        .replace(
+            "ins(%x : tensor<256x128xf32>)", "ins(%residual : tensor<256x128xf32>)"
+        )
+        .replace("ins(%x, %norm_sum", "ins(%residual, %norm_sum")
+    )
+    module = run(
+        source,
+        lambda func: transform_ext.tag_subgraphs(
+            func, ["reduction", "gemm", "elementwise"]
+        ),
+    )
+    add = operations(module, "arith.addf")[0]
+    assert (
+        ir.StringAttr(add.parent.attributes[SUBGRAPH_KIND_ATTR_NAME]).value
+        == "elementwise"
+    )
+    module = run(source, tile)
+    loops = [op for op in operations(module, "scf.forall") if op.name == "scf.forall"]
+    assert len(loops) == 4, str(module)
+    normalization = next(loop for loop in loops if operations(loop, "math.rsqrt"))
+    assert len(operations(normalization, "arith.addf")) == 1
+    assert len(operations(module, "arith.addf")) == 4  # Residual, reduction, two GEMMs.
+    print("Shared residual stays outside normalization during partitioning and tiling")
+
+
+# CHECK-LABEL: test_shared_normalization_input
+# CHECK-NEXT: Shared residual stays outside normalization during partitioning and tiling
+
+
 with ir.Context(), ir.Location.unknown():
     lh_dialects.register_and_load()
     for test in (
@@ -281,6 +331,7 @@ with ir.Context(), ir.Location.unknown():
         test_tiling,
         test_numerics,
         test_mixed_reduction,
+        test_shared_normalization_input,
     ):
         print(test.__name__)
         test()

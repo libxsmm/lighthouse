@@ -242,7 +242,13 @@ def _match_elementwise(
 def _match_reduction(
     op: ir.Operation, block_ops: list
 ) -> list[tuple[list, ir.Operation]]:
-    """Claim a closed generic reduction and its elementwise normalization DAG."""
+    """Claim normalization without crossing shared input materializations.
+
+    Follow reduction consumers first, then absorb producers only when all their
+    uses are already local. A preceding residual also used after normalization
+    stays outside; the square/cast chain used only by normalization stays inside.
+    Shared accumulator fills are cloned, not treated as kernel boundaries.
+    """
     if op.name != "linalg.generic" or not is_reduction_op(op) or is_tagged(op):
         return []
 
@@ -253,16 +259,24 @@ def _match_reduction(
             and (_is_elementwise_linalg(value) or value == op)
         )
 
-    members, worklist = [op], [op]
-    while worklist:
-        current = worklist.pop()
-        neighbors = _users(current) + [
-            p for p in map(_producer, current.operands) if p is not None
-        ]
-        for neighbor in neighbors:
-            if neighbor not in members and candidate(neighbor):
-                members.append(neighbor)
-                worklist.append(neighbor)
+    members = _forward_closure(op, [value for value in block_ops if candidate(value)])
+    changed = True
+    while changed:
+        changed = False
+        for current in list(members):
+            for value in current.operands:
+                producer = _producer(value)
+                if (
+                    producer is not None
+                    and producer not in members
+                    and candidate(producer)
+                    and (
+                        all(user in members for user in _users(producer))
+                        or producer.name == "linalg.fill"
+                    )
+                ):
+                    members.append(producer)
+                    changed = True
     sinks = [
         member for member in members if not any(u in members for u in _users(member))
     ]
@@ -272,11 +286,17 @@ def _match_reduction(
     if any(
         u not in members
         for member in members
-        if member != anchor
+        if member != anchor and member.name != "linalg.fill"
         for u in _users(member)
     ):
         return []
-    members.sort(key=block_ops.index)
+    for i, member in enumerate(members):
+        if member.name == "linalg.fill" and any(
+            user not in members for user in _users(member)
+        ):
+            members[i] = _clone_for(member, members)
+    order = {value.operation: i for i, value in enumerate(op.block.operations)}
+    members.sort(key=order.__getitem__)
     return [(members, anchor)]
 
 

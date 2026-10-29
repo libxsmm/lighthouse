@@ -20,6 +20,8 @@ class TagSubgraphsOp(TransformExtensionDialect.Operation, name="tag_subgraphs"):
       - "reduction": a generic reduction with a closed elementwise
         normalization DAG, anchored at its final elementwise output. Match
         before GEMM to materialize normalization once rather than per GEMM tile.
+        Shared input computations remain outside; shared accumulator fills are
+        cloned locally so independent normalizations do not become connected.
       - "gemm": matmul with its single-use elementwise epilogue chain and the
         elementwise producers feeding it. Producers that also have users
         outside the subgraph are cloned so each subgraph recomputes them.
