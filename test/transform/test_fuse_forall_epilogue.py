@@ -330,9 +330,59 @@ def test_numerics():
 # CHECK: Fused and unfused projection/RoPE match NumPy across tile shapes
 
 
+def test_rank_reduced_nested_consumer():
+    module = ir.Module.parse("""
+func.func @heads(%x: tensor<2x2x4x4xf32>) -> tensor<8x8xf32> {
+  %empty = tensor.empty() : tensor<2x2x4x4xf32>
+  %heads = scf.forall (%b, %h, %s) = (0,0,0) to (2,2,4) step (1,1,2)
+      shared_outs(%dest = %empty) -> tensor<2x2x4x4xf32> {
+    %tile = tensor.extract_slice %x[%b,%h,%s,0] [1,1,2,4] [1,1,1,1]
+      : tensor<2x2x4x4xf32> to tensor<2x4xf32>
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %tile into %dest[%b,%h,%s,0] [1,1,2,4] [1,1,1,1]
+        : tensor<2x4xf32> into tensor<2x2x4x4xf32>
+    }
+  }
+  %out = tensor.empty() : tensor<2x4x2x4xf32>
+  %t = linalg.transpose ins(%heads : tensor<2x2x4x4xf32>)
+      outs(%out : tensor<2x4x2x4xf32>) permutation = [0,2,1,3]
+  %flat = tensor.collapse_shape %t [[0,1],[2,3]]
+      : tensor<2x4x2x4xf32> into tensor<8x8xf32>
+  %e = tensor.empty() : tensor<8x8xf32>
+  %result = scf.forall (%m) in (2) shared_outs(%dest = %e) -> tensor<8x8xf32> {
+    %offset = affine.apply affine_map<(i)->(i*4)>(%m)
+    %tile = tensor.extract_slice %flat[%offset,0] [4,8] [1,1]
+      : tensor<8x8xf32> to tensor<4x8xf32>
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %tile into %dest[%offset,0] [4,8] [1,1]
+        : tensor<4x8xf32> into tensor<8x8xf32>
+    }
+  }
+  return %result : tensor<8x8xf32>
+}
+""")
+    with schedule_boilerplate() as (schedule, sequence):
+        loops = lh_transform.match_op(sequence.bodyTarget, "scf.forall")
+        loop = transform_ext.extract_handle(loops, 0)
+        transform_ext.fuse_forall_epilogue(loop)
+        transform.yield_([])
+    schedule.body.operations[0].apply(module.operation)
+    assert module.operation.verify()
+    loops = operations(module, "scf.forall")
+    assert len(loops) == 2
+    assert list(loops[0].result.type.shape) == [8, 8]
+    assert operations(loops[0], "linalg.transpose")
+    assert operations(loops[1], "tensor.extract_slice")[0].source == loops[0].result
+    print("Rank-reduced tiles fuse through head merging into nested consumers")
+
+
+# CHECK: Rank-reduced tiles fuse through head merging into nested consumers
+
+
 with ir.Context(), ir.Location.unknown():
     lh_dialects.register_and_load()
     test_structure()
     test_rejections()
     test_external_users()
     test_numerics()
+    test_rank_reduced_nested_consumer()

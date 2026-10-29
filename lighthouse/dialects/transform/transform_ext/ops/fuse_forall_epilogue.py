@@ -43,6 +43,27 @@ def _groups(op):
     return [[int(dim) for dim in group] for group in op.reassociation]
 
 
+def _insert_reassociation(source_shape, sizes):
+    """Reinsert unit dimensions dropped by a parallel_insert_slice."""
+    if source_shape is None or not source_shape:
+        return None
+    groups = [[] for _ in source_shape]
+    dim = 0
+    for i, size in enumerate(sizes):
+        groups[dim].append(i)
+        if size == source_shape[dim]:
+            if dim < len(groups) - 1:
+                dim += 1
+        elif size != 1:
+            return None
+    if any(
+        not group or prod(sizes[i] for i in group) != extent
+        for group, extent in zip(groups, source_shape)
+    ):
+        return None
+    return groups
+
+
 def _tensor_only(operation):
     pure = True
 
@@ -261,7 +282,7 @@ def _plan(loop, allowed=None):
     if (
         shape is None
         or len(sizes) != len(shape)
-        or _shape(insert.source) != sizes
+        or _insert_reassociation(_shape(insert.source), sizes) is None
         or insert.dest != body.arguments[rank]
         or any(size <= 0 or extent % size for extent, size in zip(shape, sizes))
     ):
@@ -351,10 +372,16 @@ def _plan(loop, allowed=None):
     if any(not _tensor_only(op.operation) for op in siblings[position + 1 : last]):
         return None
     positions = {op.operation: i for i, op in enumerate(siblings)}
+
+    def user_position(user):
+        while user is not None and user not in positions:
+            user = user.parent
+        return positions.get(user, -1) if user is not None else -1
+
     for value in outputs:
         if any(
             use.owner.operation not in node_ops
-            and positions.get(use.owner.operation, -1) <= last
+            and user_position(use.owner.operation) <= last
             for use in value.uses
         ):
             return None
@@ -437,7 +464,17 @@ def _rewrite(loop, plan, rewriter):
 
                 cloned.walk(remap)
                 values.update(zip(op.results, cloned.results))
-            values[loop.results[0]] = values.get(insert.source, insert.source)
+            source = values.get(insert.source, insert.source)
+            sizes = tiles[loop.results[0]].sizes
+            if _shape(source) != sizes:
+                source = tensor.ExpandShapeOp(
+                    _type(loop.results[0], tiles[loop.results[0]]),
+                    source,
+                    _insert_reassociation(_shape(source), sizes),
+                    [],
+                    list(sizes),
+                ).result
+            values[loop.results[0]] = source
             for op in nodes:
                 tile = tiles[op.results[0]]
                 if isinstance(op, (linalg.GenericOp, linalg.TransposeOp)):
@@ -495,7 +532,8 @@ def _rewrite(loop, plan, rewriter):
                 values[op.results[0]] = result
             output_offsets = [_offsets(tiles[value], ivs) for value in outputs]
             parallel = scf.InParallelOp()
-            parallel.regions[0].blocks.append()
+            if not parallel.regions[0].blocks:
+                parallel.regions[0].blocks.append()
             with ir.InsertionPoint(parallel.regions[0].blocks[0]):
                 for value, dest, offsets in zip(
                     outputs, body.arguments[rank:], output_offsets
@@ -531,7 +569,8 @@ class FuseForallEpilogueOp(
     Supports parallel projected-permutation generics (without linalg.index),
     transpose, rectangular expand/collapse, static non-rank-reducing unit-stride
     slices, and concat along an untiled dimension. Tiles must divide the full
-    tensor and preserve complete slice/concat dimensions. External users are
+    tensor and preserve complete slice/concat dimensions. The loop's final
+    parallel_insert_slice may drop unit dimensions. External users are
     preserved as additional loop results. Each DAG node is cloned exactly once.
 
     If `consumers` is given, only those ops are fused, and all of them must be;
