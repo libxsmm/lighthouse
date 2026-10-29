@@ -14,6 +14,7 @@ from .attention_fusion import transform_to_flash_attention
 from .lowering_common import get_payload_func
 from lighthouse.dialects.transform.transform_ext.utils.subgraph_analysis import (
     SUBGRAPH_ANCHOR_ATTR_NAME,
+    SUBGRAPH_ID_ATTR_NAME,
     SUBGRAPH_KIND_ATTR_NAME,
 )
 
@@ -51,9 +52,10 @@ def apply_subgraph_tiling(
     force_k_tile: int | None = None,
     device: str | None = None,
 ) -> ir.Operation:
-    """Partition reduction, GEMM and elementwise subgraphs and tile each into
+    """Partition attention, reduction, GEMM and elementwise subgraphs and tile each into
     its own workgroup-parallel scf.forall, i.e. its own kernel.
 
+    Attention is claimed first so softmax stays with its contractions.
     Normalization reductions are claimed before GEMM to materialize their
     outputs once, including when shared by multiple projections.
     GEMM subgraphs then claim their epilogue chains; the
@@ -61,7 +63,9 @@ def apply_subgraph_tiling(
     are also supported. Fails silenceably if a linalg op is left unpartitioned.
     """
 
-    func = transform_ext.tag_subgraphs(func, kinds=["reduction", "gemm", "elementwise"])
+    func = transform_ext.tag_subgraphs(
+        func, kinds=["attention", "reduction", "gemm", "elementwise"]
+    )
 
     with lh_transform.foreach(_subgraph_anchors(func, "reduction")) as anchor:
         # Standalone reductions keep the existing schedule and its overrides.
@@ -121,6 +125,21 @@ def apply_subgraph_tiling(
         wg_loop = _tile_subgraph(anchor, producers, consumers, wg_tile)
         lh_transform.cleanup(wg_loop)
         transform.yield_()
+
+    attention_ids = transform_ext.get_named_attribute(
+        _subgraph_anchors(func, "attention"), SUBGRAPH_ID_ATTR_NAME
+    )
+    with lh_transform.foreach(attention_ids):
+        # Standalone attention retains its schedule overrides and fallback path.
+        transform_ext.extract_handle(
+            lh_transform.match_op(func, "linalg.matmul"), 0, silenceable=True
+        )
+        transform.yield_()
+    func = _prepare_attention_shapes(func, attention_ids)
+    with lh_transform.foreach(attention_ids) as id:
+        apply_attention_tiling(func, subgraph=id)
+        transform.yield_()
+    func = apply_registered_pass(func, "remove-dead-values")
 
     transform_ext.clear_subgraph_tags(func)
     func = transform_ext.split_concat_output(func)
@@ -230,77 +249,131 @@ def apply_reduction_tiling(
     return func
 
 
-def apply_attention_tiling(
-    func: ir.Operation,
-    force_wg_tile: int | None = None,
-    force_reduction_tile: int | None = None,
-) -> ir.Operation:
-    """Tile attention, including causal score producers, into one WG kernel.
-
-    Producer fusion tiles the mask with QK scores and preserves global query
-    and key offsets in linalg.index. No full score or mask tensor is stored.
-    """
+def _prepare_attention_shapes(func, subgraphs=None):
+    """Expand only the selected attention iteration spaces before WG tiling."""
     anytype = transform.AnyOpType.get()
-
-    # Clean up to fully expanded shapes by eliminating expand/collapse shape pairs.
-    # Generalize all transpose ops.
-    transpose_ops = lh_transform.match_op(func, "linalg.transpose")
+    transpose_ops = (
+        lh_transform.match_op(func, "linalg.transpose")
+        if subgraphs is None
+        else transform_ext.match_subgraph(func, subgraphs, "linalg.transpose")
+    )
     structured.structured_generalize(anytype, transpose_ops)
     for i in range(3):
         # Fold reshape ops by expansion and fold extract_slice into tensor.empty
         # Repeat until no more folding.
-        func = transform_ext.fold_reshape_ops_by_expansion(func)
+        func = transform_ext.fold_reshape_ops_by_expansion(func, subgraph=subgraphs)
         with ir.InsertionPoint(transform.apply_patterns(func).patterns):
             tensor.apply_patterns_tensor_fold_tensor_empty(fold_single_use_only=False)
     lh_transform.cleanup(func)
+    return func
+
+
+def apply_attention_tiling(
+    func: ir.Operation,
+    force_wg_tile: int | None = None,
+    force_reduction_tile: int | None = None,
+    subgraph: ir.Value | None = None,
+) -> ir.Operation:
+    """Tile attention, including causal score producers, into one WG kernel.
+
+    With a subgraph id, shapes must already be prepared. Matching and initial
+    fusion are restricted to its members; online fusion stays inside the WG.
+    No full score or mask tensor is stored, and mask indices retain global
+    query/key offsets.
+    """
+    anytype = transform.AnyOpType.get()
+    if subgraph is None:
+        func = _prepare_attention_shapes(func)
+
+    def attention_ops(names):
+        if subgraph is None:
+            return lh_transform.match_op(func, names)
+        return transform_ext.match_subgraph(func, subgraph, names)
 
     # Find the subtract and exp reduction loops and fuse them.
     subf_op = transform_ext.extract_handle(
-        lh_transform.match_op(func, "arith.subf"),
+        attention_ops("arith.subf"),
         0,
         silenceable=True,
     )
     subf_loop = transform.get_parent_op(anytype, subf_op, op_name="linalg.generic")
     exp_op = transform_ext.extract_handle(
-        lh_transform.match_op(func, "math.exp"),
+        attention_ops("math.exp"),
         0,
         silenceable=True,
     )
     exp_loop = transform.get_parent_op(anytype, exp_op, op_name="linalg.generic")
-    transform_ext.fuse_elementwise_op(subf_loop, exp_loop)
+    fused = transform_ext.fuse_elementwise_op(subf_loop, exp_loop)
+    if subgraph is not None:
+        transform.annotate(fused, SUBGRAPH_ID_ATTR_NAME, param=subgraph)
 
     lh_transform.cleanup(func)
 
     # Move the normalizing divide past @V to form the deferred-divide chain.
     contraction_ops = transform_ext.filter_contraction_ops(
-        structured.structured_match(anytype, func, ops=["linalg.generic"])
+        attention_ops("linalg.generic")
     )
     pv_contraction = transform_ext.extract_handle(contraction_ops, -1, silenceable=True)
-    transform_ext.sink_normalization_past_contraction(pv_contraction)
+    contraction, normalization = transform_ext.sink_normalization_past_contraction(
+        pv_contraction
+    )
+    if subgraph is not None:
+        transform.annotate(contraction, SUBGRAPH_ID_ATTR_NAME, param=subgraph)
+        transform.annotate(normalization, SUBGRAPH_ID_ATTR_NAME, param=subgraph)
     lh_transform.cleanup(func)
 
     # Apply WG tiling.
-    linalg_ops = lh_transform.match_op(func, ["linalg.generic", "linalg.batch_matmul"])
+    linalg_ops = attention_ops(["linalg.generic", "linalg.batch_matmul"])
     leaf_linalg_op = transform_ext.extract_handle(linalg_ops, -1, silenceable=True)
     wg_tile, _sg_tile, reduction_tile = transform_ext.infer_xegpu_attention_params(
         leaf_linalg_op,
         force_wg_tile=force_wg_tile,
         force_reduction_tile=force_reduction_tile,
     )
-    lh_transform.tile(
-        leaf_linalg_op,
-        tile_sizes=wg_tile,
-        fuse_producers=True,
-        use_forall=True,
-        apply_cleanup=False,
-    )
+    if subgraph is None:
+        _, [wg_loop], _ = lh_transform.tile(
+            leaf_linalg_op,
+            tile_sizes=wg_tile,
+            fuse_producers=True,
+            use_forall=True,
+            apply_cleanup=False,
+        )
+    else:
+        # A shared producer must follow every consumer, not merely its nearest one.
+        producers = transform_ext.filter_by_name(
+            transform_ext.trace_producers(
+                leaf_linalg_op,
+                scope=func,
+                subgraph=subgraph,
+                order="reverse-topological",
+            ),
+            [
+                "linalg.generic",
+                "linalg.batch_matmul",
+                "linalg.transpose",
+                "linalg.fill",
+            ],
+        )
+        _, wg_loop = structured.TileUsingForallOp(
+            leaf_linalg_op, tile_sizes=wg_tile
+        ).results
+        _, wg_loop = structured.structured_fuse_into_containing_op(
+            anytype, anytype, producer_op=producers, containing_op=wg_loop
+        )
     lh_transform.cleanup(func)
 
-    func = transform_to_flash_attention(anytype, func, reduction_tile)
+    wg_loop = transform_to_flash_attention(
+        anytype, wg_loop, reduction_tile, remove_dead_values=False
+    )
+    if subgraph is None:
+        func = apply_registered_pass(func, "remove-dead-values")
 
     # Inline splat-constant generic inputs (e.g. masked-select zero) as
     # scalars so they are not vectorized into reads of constant tensors.
-    func = transform_ext.fold_scalar_or_splat_constant(func)
+    if subgraph is None:
+        func = transform_ext.fold_scalar_or_splat_constant(func)
+    else:
+        transform_ext.fold_scalar_or_splat_constant(wg_loop)
     lh_transform.cleanup(func)
 
     # Write the result through an expanded view of the output memref so the GQA
@@ -329,7 +402,6 @@ def wg_tiling_schedule(
             op_name=op_names,
             func_name=payload_func_name,
         )
-
         # Use alternatives op to try different lowerings. The defined regions
         # are applied in order, if one fails with a SilenceableFailure, the
         # next alternative is tried. The last region emits a definite failure
@@ -364,6 +436,8 @@ def wg_tiling_schedule(
             )
             transform.yield_([func])
         payload_func = alt.results[0]
+        payload_func = transform_ext.expand_output_destination(payload_func)
+        lh_transform.cleanup(payload_func)
 
         # Fold unit dimensions.
         # Generalize named ops so unit dims in transpose ops are folded too.
