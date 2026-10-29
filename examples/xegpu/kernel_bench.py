@@ -153,7 +153,22 @@ def infer_parameters(
             print(f"Layer {i}")
             for k, v in layer.items():
                 print(f"  {k}: {v}")
-    if len(matmuls) > 0 and len(batch_matmuls) == 0:
+    if matmuls and batch_matmuls:
+        # Composed graphs need independent inference for every kernel kind.
+        schedule_params = ScheduleParameters([{"layer_kind": "mixed"}])
+        schedule_kind = "mlp"
+        total_flops = sum(
+            2 * int(np.prod(layer["shape"])) for layer in matmuls + batch_matmuls
+        )
+        read_bytes = sum(
+            int(np.prod(t.shape)) * elemtype_bytes[str(t.element_type)]
+            for t in func_metadata["inputs"][:-1]
+        )
+        output = func_metadata["inputs"][-1]
+        write_bytes = (
+            int(np.prod(output.shape)) * elemtype_bytes[str(output.element_type)]
+        )
+    elif len(matmuls) > 0 and len(batch_matmuls) == 0:
         schedule_params = XeGPUParameterSelector().get_parameters_for_layers(matmuls)
         # check that all matmul dims are powers of 2
         for mmul in matmuls:
@@ -520,14 +535,15 @@ def infer_params_and_lower(
             for k, v in param_dict.items():
                 print(f"  {k}: {v}")
 
-    # GEMM tile overrides must not leak into a separate normalization kernel.
-    mixed_reduction_gemm = bool(matmuls) and any(
-        layer["kind"] == "reduction" for layer in func_metadata["layers"]
+    # GEMM overrides must not leak into normalization or attention kernels.
+    mixed_kernel_graph = bool(matmuls) and any(
+        layer["kind"] in ("reduction", "batch_matmul")
+        for layer in func_metadata["layers"]
     )
     lowered_mod = lower_to_llvm(
         mod=mod,
         schedule_kind=schedule_kind,
-        schedule_params=None if mixed_reduction_gemm else schedule_params,
+        schedule_params=None if mixed_kernel_graph else schedule_params,
         device="B70" if schedule_kind == "mlp" else None,
         stop_at_stage=stop_at_stage,
         benchmark=benchmark,
