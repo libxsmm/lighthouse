@@ -23,6 +23,9 @@ class TagSubgraphsOp(TransformExtensionDialect.Operation, name="tag_subgraphs"):
       - "gemm": matmul with its single-use elementwise epilogue chain and the
         elementwise producers feeding it. Producers that also have users
         outside the subgraph are cloned so each subgraph recomputes them.
+        Token-only expand_shape and elementwise epilogue DAGs are fused forward.
+        A join belongs to the last available branch: external inputs must
+        already be defined at the root matmul, avoiding cyclic kernel ordering.
       - "elementwise": connected elementwise linalg ops and the reshapes,
         slices, and concats between them.
 

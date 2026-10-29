@@ -22,7 +22,7 @@ from lighthouse.schedule.xegpu.wg_tiling_schedule import apply_subgraph_tiling
 
 
 # Two GEMMs share the accumulator fill. The first has a ReLU epilogue, the
-# second feeds a reshape + elementwise DAG that forms its own subgraph.
+# second feeds a token reshape + elementwise DAG fused into its epilogue.
 SOURCE = """
 #id2 = affine_map<(m,n)->(m,n)>
 #id3 = affine_map<(b,s,d)->(b,s,d)>
@@ -174,10 +174,10 @@ def test_tagging():
 # CHECK-NEXT: linalg.matmul gemm 1 producer
 # CHECK-NEXT: linalg.generic gemm 1 anchor
 # CHECK-NEXT: linalg.matmul gemm 2 anchor
-# The reshape stays outside of the anchor loop, the DAG is fused forward.
-# CHECK-NEXT: linalg.generic elementwise 3 anchor
-# CHECK-NEXT: linalg.generic elementwise 3 consumer
-# CHECK-NEXT: tensor.expand_shape elementwise 3
+# The token reshape and DAG are fused forward into the GEMM loop.
+# CHECK-NEXT: linalg.generic gemm 2 consumer
+# CHECK-NEXT: linalg.generic gemm 2 consumer
+# CHECK-NEXT: tensor.expand_shape gemm 2 consumer
 
 
 def test_untagged():
@@ -213,10 +213,9 @@ def test_tiling():
 
 
 # CHECK-LABEL: test_tiling
-# CHECK-NEXT: 3 workgroup loops
+# CHECK-NEXT: 2 workgroup loops
 # CHECK-NEXT: linalg.fill, linalg.generic, linalg.matmul
-# CHECK-NEXT: linalg.fill, linalg.matmul
-# CHECK-NEXT: linalg.generic
+# CHECK-NEXT: linalg.fill, linalg.generic, linalg.matmul
 
 
 def test_numerics(source=SOURCE):
@@ -257,7 +256,7 @@ def test_numerics(source=SOURCE):
 def test_mixed_reduction():
     module = run(NORMALIZED, tile)
     loops = [op for op in operations(module, "scf.forall") if op.name == "scf.forall"]
-    assert len(loops) == 4, str(module)
+    assert len(loops) == 3, str(module)
     assert len(operations(loops[0], "math.rsqrt")) == 1
     assert not operations(loops[0], "linalg.matmul")
     for loop in loops[1:]:
