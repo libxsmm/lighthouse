@@ -150,7 +150,7 @@ def _dpas_shape_and_transpose(
 
 
 def _first_producer_named(value: ir.Value, op_name: str) -> ir.Operation | None:
-    """First producer op with `op_name` in `value`'s producer chain, or None."""
+    """Find local operand plumbing, stopping at computations and rank changes."""
     if value is None or isinstance(value, ir.BlockArgument):
         return None
     op = defining_op(value)
@@ -158,10 +158,13 @@ def _first_producer_named(value: ir.Value, op_name: str) -> ir.Operation | None:
         return None
     if op.name == op_name:
         return op
-    for operand in op.operands:
-        found = _first_producer_named(operand, op_name)
-        if found is not None:
-            return found
+    if op.name in (
+        "tensor.extract_slice",
+        "tensor.cast",
+        "linalg.transpose",
+        "linalg.broadcast",
+    ):
+        return _first_producer_named(op.operands[0], op_name)
     return None
 
 
