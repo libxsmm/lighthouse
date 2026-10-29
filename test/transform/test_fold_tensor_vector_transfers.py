@@ -67,6 +67,18 @@ func.func @subset(%v: vector<2x4xf32>, %base: tensor<4x8xf32>)
 }
 """
 
+RESHAPED_WRITE = """
+func.func @reshape_write(%v: vector<4x1x8xf32>, %base: tensor<1x4x1x8xf32>)
+    -> tensor<4x8xf32> {
+  %c0 = arith.constant 0 : index
+  %w = vector.transfer_write %v, %base[%c0,%c0,%c0,%c0]
+    {in_bounds=[true,true,true]} : vector<4x1x8xf32>, tensor<1x4x1x8xf32>
+  %c = tensor.collapse_shape %w [[0,1],[2,3]]
+    : tensor<1x4x1x8xf32> into tensor<4x8xf32>
+  return %c : tensor<4x8xf32>
+}
+"""
+
 
 def operations(module, name):
     found = []
@@ -124,6 +136,11 @@ func.func @collapse(%v: vector<2x2x4xf32>) -> vector<2x8xf32> {
 }
 """
     assert "tensor." not in str(apply(collapsed))
+    reshaped = apply(RESHAPED_WRITE)
+    assert not operations(reshaped, "tensor.collapse_shape")
+    (write,) = operations(reshaped, "vector.transfer_write")
+    assert list(write.opview.valueToStore.type.shape) == [4, 8]
+    assert list(write.opview.base.type.shape) == [4, 8]
     print("Reshape, subset and concat transfers stay in vector SSA")
 
 
@@ -131,6 +148,13 @@ func.func @collapse(%v: vector<2x2x4xf32>) -> vector<2x8xf32> {
 
 
 def test_rejections():
+    partial_write = RESHAPED_WRITE.replace("vector<4x1x8xf32>", "vector<2x1x8xf32>")
+    assert operations(apply(partial_write), "tensor.collapse_shape")
+    masked_reshape = RESHAPED_WRITE.replace(
+        "  %w =",
+        "  %mask = arith.constant dense<false> : vector<4x1x8xi1>\n  %w =",
+    ).replace("%base[%c0,%c0,%c0,%c0]", "%base[%c0,%c0,%c0,%c0], %mask")
+    assert operations(apply(masked_reshape), "tensor.collapse_shape")
     outside = SUBSET.replace("%w[%c2,%c3]", "%w[%c3,%c3]")
     assert len(operations(apply(outside), "vector.transfer_read")) == 1
     dynamic = SUBSET.replace(

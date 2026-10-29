@@ -1,5 +1,5 @@
 from mlir import ir
-from mlir.dialects import arith, ext, transform, ub, vector
+from mlir.dialects import arith, ext, tensor, transform, ub, vector
 from mlir.dialects.transform import DiagnosedSilenceableFailure
 from mlir.passmanager import PassManager
 
@@ -12,7 +12,8 @@ class FoldTensorVectorTransfersOp(
     """Keep tensor reshapes, slices and concatenations between transfers in SSA.
 
     Complements native transfer forwarding with static, unmasked, minor-identity
-    reads of reshapes/concats and reads contained in a preceding tensor write.
+    reads of reshapes/concats, reads contained in a preceding tensor write, and
+    reshapes of fully overwritten tensors.
     No buffer aliasing or floating-point reassociation is involved. Unsupported
     transfers are left unchanged.
 
@@ -23,7 +24,7 @@ class FoldTensorVectorTransfersOp(
 
     Upstreaming plan:
       1. Extend native read-after-write forwarding to handle contained reads.
-      2. Add full-read-through-tensor-reshape folding.
+      2. Add full read/write-through-tensor-reshape folding.
       3. Add concat-read vectorization as an opt-in pattern, since it changes
          representation and potentially vector sizes.
       4. Reuse upstream's existing extract-slice folding.
@@ -196,11 +197,13 @@ def _rewrite(target: ir.Operation) -> None:
     subset_folding = PassManager.parse("any(fold-tensor-subset-ops)")
     while True:
         subset_folding.run(target)
-        reads = []
+        reads, reshapes = [], []
 
         def collect(op):
             if op.name == "vector.transfer_read":
                 reads.append(op)
+            elif op.name in ("tensor.expand_shape", "tensor.collapse_shape"):
+                reshapes.append(op)
             return ir.WalkResult.ADVANCE
 
         target.walk(collect)
@@ -217,6 +220,40 @@ def _rewrite(target: ir.Operation) -> None:
                 op.results[0].replace_all_uses_with(replacement)
                 op.erase()
                 changed = True
+        for reshape in reshapes:
+            source = reshape.operands[0]
+            owner = source.owner
+            if (
+                isinstance(owner, ir.Block)
+                or owner.operation.name != "vector.transfer_write"
+                or _shape(source) is None
+                or _shape(reshape.results[0]) is None
+                or ir.RankedTensorType(source.type).encoding is not None
+                or ir.RankedTensorType(reshape.results[0].type).encoding is not None
+            ):
+                continue
+            write = owner.operation.opview
+            region = _region(write)
+            if region != ([0] * len(_shape(source)), _shape(source)):
+                continue
+            with ir.InsertionPoint(reshape), reshape.location:
+                shape = _shape(reshape.results[0])
+                value = _cast(write.valueToStore, shape)
+                dest = tensor.EmptyOp(
+                    shape, ir.RankedTensorType(source.type).element_type
+                ).result
+                zero = arith.ConstantOp(ir.IndexType.get(), 0).result
+                replacement = vector.TransferWriteOp(
+                    dest.type,
+                    value,
+                    dest,
+                    [zero] * len(shape),
+                    _minor_identity(len(shape), len(shape)),
+                    [True] * len(shape),
+                ).result
+            reshape.results[0].replace_all_uses_with(replacement)
+            reshape.erase()
+            changed = True
         if not changed:
             return
 
