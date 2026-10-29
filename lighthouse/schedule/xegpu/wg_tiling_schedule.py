@@ -255,7 +255,9 @@ def _prepare_attention_shapes(func, subgraphs=None):
     transpose_ops = (
         lh_transform.match_op(func, "linalg.transpose")
         if subgraphs is None
-        else transform_ext.match_subgraph(func, subgraphs, "linalg.transpose")
+        else transform_ext.match_subgraph(
+            func, subgraphs, "linalg.transpose", role="body"
+        )
     )
     structured.structured_generalize(anytype, transpose_ops)
     for i in range(3):
@@ -288,7 +290,7 @@ def apply_attention_tiling(
     def attention_ops(names):
         if subgraph is None:
             return lh_transform.match_op(func, names)
-        return transform_ext.match_subgraph(func, subgraph, names)
+        return transform_ext.match_subgraph(func, subgraph, names, role="body")
 
     # Find the subtract and exp reduction loops and fuse them.
     subf_op = transform_ext.extract_handle(
@@ -365,6 +367,9 @@ def apply_attention_tiling(
     wg_loop = transform_to_flash_attention(
         anytype, wg_loop, reduction_tile, remove_dead_values=False
     )
+    if subgraph is not None:
+        consumers = transform_ext.match_subgraph(func, subgraph, role="epilogue")
+        wg_loop = transform_ext.fuse_forall_epilogue(wg_loop, consumers)
     if subgraph is None:
         func = apply_registered_pass(func, "remove-dead-values")
 
