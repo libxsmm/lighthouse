@@ -6,8 +6,8 @@
 # WG: vector.broadcast %[[QUERY]] : index
 # WG: scf.for %[[KEY:[a-zA-Z0-9_]+]] =
 # WG: vector.broadcast %[[KEY]] : index
-# WG: arith.cmpi sle, {{.*}} : vector<128x64xi64>
-# WG: arith.select
+# WG: arith.cmpi sge, {{.*}} : vector<128x64xi64>
+# WG: math.log
 # WG: xegpu.dpas
 # WG: vector.multi_reduction <maxnumf>
 # WG: math.exp
@@ -31,9 +31,17 @@ class Model(nn.Module):
       * Grouped-query attention: 32 query heads share 8 key/value heads
         (num_heads / num_kv_heads = 4). K/V carry fewer heads than Q and are
         broadcast across the group (enable_gqa=True).
-      * Causal masking (is_causal=True), as in autoregressive decoding/prefill.
+      * Explicit causal masking, as in autoregressive decoding/prefill.
 
-    RoPE is intentionally NOT applied here. Q/K/V are taken as
+    Torch-MLIR 20261001 can fail to import SDPA's internal is_causal=True mask
+    on XPU: its boolean aten.empty.memory_format cannot be legalized. Build the
+    same mask from indices and pass is_causal=False to avoid that allocation.
+    SDPA's boolean-mask conversion also failed with a scalar f64
+    torch.vtensor.literal on XPU. Supply an additive mask in Q's dtype, derived
+    from the predicate rather than new_zeros (which hit empty.memory_format too).
+    log maps allowed=1 to zero and blocked=0 to -inf without a tensor factory.
+
+    RoPE is intentionally not applied here. Q/K/V are taken as
     already-projected inputs, matching level1-97.
     """
 
@@ -44,8 +52,12 @@ class Model(nn.Module):
         self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor
     ) -> torch.Tensor:
         # Q: (batch, num_heads, n_ctx, d_head); K/V: (batch, num_kv_heads, n_ctx, d_head)
+        rows = torch.arange(Q.shape[-2], device=Q.device)
+        cols = torch.arange(K.shape[-2], device=K.device)
+        allowed = rows[:, None] >= cols[None, :]
+        mask = allowed.to(dtype=Q.dtype).log()
         return torch.nn.functional.scaled_dot_product_attention(
-            Q, K, V, is_causal=True, enable_gqa=True
+            Q, K, V, attn_mask=mask, is_causal=False, enable_gqa=True
         )
 
 
