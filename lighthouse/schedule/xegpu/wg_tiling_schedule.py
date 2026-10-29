@@ -235,7 +235,11 @@ def apply_attention_tiling(
     force_wg_tile: int | None = None,
     force_reduction_tile: int | None = None,
 ) -> ir.Operation:
-    """Apply attention-layer workgroup tiling to the given function."""
+    """Tile attention, including causal score producers, into one WG kernel.
+
+    Producer fusion tiles the mask with QK scores and preserves global query
+    and key offsets in linalg.index. No full score or mask tensor is stored.
+    """
     anytype = transform.AnyOpType.get()
 
     # Clean up to fully expanded shapes by eliminating expand/collapse shape pairs.
