@@ -15,6 +15,8 @@ class TagSubgraphsOp(TransformExtensionDialect.Operation, name="tag_subgraphs"):
     `transform_ext.subgraph_kind` and `transform_ext.subgraph_id` attributes,
     and the op to tile additionally gets `transform_ext.subgraph_anchor`.
     Supported kinds:
+      - "attention": closed QK-softmax-PV DAG and attention-local prologues.
+        Match first to keep its reductions and elementwise ops together.
       - "reduction": a generic reduction with a closed elementwise
         normalization DAG, anchored at its final elementwise output. Match
         before GEMM to materialize normalization once rather than per GEMM tile.

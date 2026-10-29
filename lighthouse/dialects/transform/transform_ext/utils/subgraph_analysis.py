@@ -22,6 +22,9 @@ from lighthouse.dialects.transform.transform_ext.ops.filter_reduction_ops import
     is_reduction_op,
 )
 from lighthouse.utils.mlir import opview
+from lighthouse.dialects.transform.transform_ext.ops.filter_contraction_ops import (
+    is_contraction_op,
+)
 
 SUBGRAPH_KIND_ATTR_NAME = "transform_ext.subgraph_kind"
 SUBGRAPH_ID_ATTR_NAME = "transform_ext.subgraph_id"
@@ -231,7 +234,110 @@ def _match_reduction(
     return [(members, anchor)]
 
 
+def _contains(op, names):
+    found = []
+
+    def visit(inner):
+        if inner.name in names:
+            found.append(inner)
+        return ir.WalkResult.ADVANCE
+
+    op.walk(visit)
+    return bool(found)
+
+
+def _match_attention(root, block_ops):
+    """Claim a closed QK-softmax-PV DAG, stopping at projection/RoPE inputs."""
+    if (
+        is_tagged(root)
+        or root.name not in ("linalg.generic", "linalg.batch_matmul")
+        or not is_contraction_op(root)
+    ):
+        return []
+    movement = {
+        "tensor.expand_shape",
+        "tensor.collapse_shape",
+        "tensor.extract_slice",
+        "tensor.insert_slice",
+        "linalg.transpose",
+    }
+    members, worklist = [root], [root]
+    while worklist:
+        for user in _users(worklist.pop()):
+            if (
+                user in block_ops
+                and user not in members
+                and not is_tagged(user)
+                and (
+                    (_is_linalg(user) and user.name != "linalg.matmul")
+                    or user.name in movement
+                )
+            ):
+                members.append(user)
+                worklist.append(user)
+    if sum(is_contraction_op(o) for o in members) != 2:
+        return []
+    if not any(_contains(o, {"math.exp"}) for o in members) or not any(
+        _contains(o, {"arith.maximumf", "arith.maxnumf"}) for o in members
+    ):
+        return []
+    sinks = [o for o in members if not any(u in members for u in _users(o))]
+    if len(sinks) != 1 or len(sinks[0].results) != 1:
+        return []
+    sink = sinks[0]
+    if any(u not in members for o in members if o != sink for u in _users(o)):
+        return []
+
+    def prologue(op):
+        if is_tagged(op):
+            return False
+        if op.name in movement or op.name in (
+            "tensor.empty",
+            "arith.constant",
+            "linalg.fill",
+        ):
+            return True
+        if not _is_elementwise_linalg(op):
+            return False
+        if _contains(op, {"arith.addf", "arith.subf", "arith.negf"}):
+            return False
+        if any(
+            p is not None and p.name == "linalg.matmul"
+            for p in map(_producer, op.operands)
+        ):
+            return False
+        return not _contains(op, {"arith.mulf"}) or len(op.opview.inputs) <= 1
+
+    worklist = list(members)
+    while worklist:
+        current = worklist.pop()
+        operands = []
+
+        def captures(inner):
+            operands.extend(inner.operands)
+            return ir.WalkResult.ADVANCE
+
+        current.walk(captures)
+        for value in operands:
+            producer = _producer(value)
+            if (
+                producer is not None
+                and producer in block_ops
+                and producer not in members
+                and prologue(producer)
+            ):
+                members.append(producer)
+                worklist.append(producer)
+    members.sort(key=block_ops.index)
+    # Shared attention prologues are recomputed without claiming their other uses.
+    for i, member in enumerate(members):
+        if member != sink and any(u not in members for u in _users(member)):
+            members[i] = _clone_for(member, members)
+    return [(members, sink)]
+
+
 SUBGRAPH_MATCHERS: dict[str, Callable] = {
+    "attention": _match_attention,
     "reduction": _match_reduction,
     "gemm": _match_gemm,
     "elementwise": _match_elementwise,
