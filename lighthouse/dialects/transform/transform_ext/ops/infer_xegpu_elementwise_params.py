@@ -3,6 +3,10 @@ from mlir.dialects import ext, transform
 from mlir.dialects.transform import DiagnosedSilenceableFailure
 
 from lighthouse.dialects.transform.transform_ext import TransformExtensionDialect
+from lighthouse.dialects.transform.transform_ext.ops.filter_elementwise import (
+    is_elementwise,
+)
+from lighthouse.utils.mlir import indexing_maps
 
 # Upper bounds for the elements of one workgroup tile and of its innermost dim.
 _MAX_WG_TILE_ELEMS = 8192
@@ -39,8 +43,9 @@ class InferXeGPUElementwiseParamsOp(
     """
     Infer the XeGPU workgroup tile of an elementwise anchor op.
 
-    The tile is derived from the static shape of the single result of the
-    target (see `elementwise_wg_tile`). Zero marks an untiled dim.
+    The tile is derived from the positive static shape of the single result of
+    the target (see `elementwise_wg_tile`), then mapped into iteration order.
+    The result indexing map must be a permutation. Zero marks an untiled dim.
 
     Args:
         target: Handle to a single elementwise anchor op.
@@ -68,9 +73,31 @@ class InferXeGPUElementwiseParamsOp(
             if len(targets) != 1 or len(targets[0].results) != 1:
                 return DiagnosedSilenceableFailure.SilenceableFailure
             ty = targets[0].results[0].type
-            if not isinstance(ty, ir.RankedTensorType) or not ty.has_static_shape:
+            if (
+                not isinstance(ty, ir.RankedTensorType)
+                or not ty.rank
+                or any(size <= 0 for size in ty.shape)
+                or ty.encoding is not None
+            ):
+                op.location.emit_error(
+                    "infer_xegpu_elementwise_params: expected a positive-rank, "
+                    "positive static, unencoded tensor result"
+                )
                 return DiagnosedSilenceableFailure.SilenceableFailure
-            tile = elementwise_wg_tile(list(ty.shape))
+            maps = indexing_maps(targets[0])
+            if (
+                not maps
+                or not is_elementwise(targets[0])
+                or not maps[-1].is_permutation
+            ):
+                op.location.emit_error(
+                    "infer_xegpu_elementwise_params: expected an elementwise "
+                    "linalg op with a permutation result map"
+                )
+                return DiagnosedSilenceableFailure.SilenceableFailure
+            tile = [0] * maps[-1].n_dims
+            for dim, size in zip(maps[-1].results, elementwise_wg_tile(list(ty.shape))):
+                tile[dim.position] = size
             i64 = ir.IntegerType.get_signless(64)
             results.set_params(op.wg_tile, [ir.IntegerAttr.get(i64, t) for t in tile])
             return DiagnosedSilenceableFailure.Success

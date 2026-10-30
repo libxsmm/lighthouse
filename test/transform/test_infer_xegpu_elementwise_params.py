@@ -51,6 +51,73 @@ def test():
         print(payload)
 
 
+def test_permuted_result():
+    with ir.Context(), ir.Location.unknown():
+        lh_dialects.register_and_load()
+        payload = ir.Module.parse("""
+module {
+  func.func @payload(%arg: tensor<512x64xf32>, %out: tensor<64x512xf32>)
+      -> tensor<64x512xf32> {
+    %result = linalg.generic {
+        indexing_maps=[affine_map<(i,j)->(i,j)>, affine_map<(i,j)->(j,i)>],
+        iterator_types=["parallel","parallel"]}
+      ins(%arg : tensor<512x64xf32>) outs(%out : tensor<64x512xf32>) {
+    ^bb0(%a: f32, %o: f32):
+      linalg.yield %a : f32
+    } -> tensor<64x512xf32>
+    return %result : tensor<64x512xf32>
+  }
+}
+""")
+        schedule = build_schedule()
+        schedule.body.operations[0].apply(payload.operation)
+        assert payload.operation.verify()
+        loops = []
+
+        def visit(op):
+            if op.name == "scf.forall":
+                loops.append(op.opview)
+            return ir.WalkResult.ADVANCE
+
+        payload.operation.walk(visit)
+        assert len(loops) == 1
+        assert list(loops[0].staticUpperBound) == [2, 2]
+        print("Permuted output tiles are returned in iteration order")
+
+
+def test_unsupported_shapes():
+    for shape, dimensions, iterators in (
+        ("", "", ""),
+        ("0x64x", "i,j", '"parallel","parallel"'),
+    ):
+        with ir.Context(), ir.Location.unknown():
+            lh_dialects.register_and_load()
+            payload = ir.Module.parse(f"""
+module {{
+  func.func @payload(%arg: tensor<{shape}f32>, %out: tensor<{shape}f32>)
+      -> tensor<{shape}f32> {{
+    %result = linalg.generic {{
+        indexing_maps=[affine_map<({dimensions})->({dimensions})>,
+                       affine_map<({dimensions})->({dimensions})>],
+        iterator_types=[{iterators}]}}
+      ins(%arg : tensor<{shape}f32>) outs(%out : tensor<{shape}f32>) {{
+    ^bb0(%a: f32, %o: f32):
+      linalg.yield %a : f32
+    }} -> tensor<{shape}f32>
+    return %result : tensor<{shape}f32>
+  }}
+}}
+""")
+            try:
+                schedule = build_schedule()
+                schedule.body.operations[0].apply(payload.operation)
+            except ValueError as error:
+                assert "positive-rank" in str(error), str(error)
+            else:
+                raise AssertionError("Expected unsupported shape to fail")
+    print("Scalar and empty elementwise shapes fail without Python exceptions")
+
+
 # CHECK: scf.forall
 # CHECK-SAME: in (4, 32, 4)
 # CHECK: tensor.extract_slice
@@ -58,3 +125,8 @@ def test():
 
 
 test()
+test_permuted_result()
+test_unsupported_shapes()
+
+# CHECK: Permuted output tiles are returned in iteration order
+# CHECK: Scalar and empty elementwise shapes fail without Python exceptions
