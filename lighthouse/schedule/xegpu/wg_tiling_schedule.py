@@ -36,12 +36,21 @@ def _tile_subgraph(
     consumers: ir.Value,
     wg_tile: list | ir.Value,
 ) -> ir.Value:
-    """Tile a subgraph anchor into an scf.forall and fuse the other ops of the
-    subgraph into it: producers backward, consumers forward. Returns the loop."""
+    """Tile the anchor into an scf.forall and fuse its subgraph into it.
+
+    Both producers and consumers must be supplied in program order, as returned
+    by get_subgraph_ops. This helper reverses producers before fusing them so
+    their consumers are fused first, including all users of shared producers.
+    Consumers of the anchor are then fused forward in the supplied order.
+    Returns the workgroup loop.
+    """
     anytype = transform.AnyOpType.get()
     _, wg_loop = structured.TileUsingForallOp(anchor, tile_sizes=wg_tile).results
     _, wg_loop = structured.structured_fuse_into_containing_op(
-        anytype, anytype, producer_op=producers, containing_op=wg_loop
+        anytype,
+        anytype,
+        producer_op=transform_ext.reverse_handles(producers),
+        containing_op=wg_loop,
     )
     return transform_ext.fuse_forall_epilogue(wg_loop, consumers)
 
