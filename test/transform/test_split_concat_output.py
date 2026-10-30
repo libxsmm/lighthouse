@@ -99,6 +99,15 @@ func.func @rope(%a: tensor<2x3xf32>, %b: tensor<2x5xf32>,
 }
 """
 
+RESHAPED = SOURCE.replace("%rot = tensor.concat", "%raw_rot = tensor.concat").replace(
+    "    %c = tensor.extract_slice",
+    """    %flat_rot = tensor.collapse_shape %raw_rot [[0,1],[2]]
+      : tensor<1x2x6xf32> into tensor<2x6xf32>
+    %rot = tensor.expand_shape %flat_rot [[0,1],[2]] output_shape [1,2,6]
+      : tensor<2x6xf32> into tensor<1x2x6xf32>
+    %c = tensor.extract_slice""",
+)
+
 
 def operations(module, name):
     found = []
@@ -148,9 +157,10 @@ def test_structure():
         ]
     assert str(apply(str(module))) == str(module)
     assert str(apply(target_forall=True)) == str(module)
-    vectorized = apply(vectorize=True)
-    for name in ("vector.extract_strided_slice", "vector.insert_strided_slice"):
-        assert not operations(vectorized, name)
+    for source in (SOURCE, RESHAPED):
+        vectorized = apply(source, vectorize=True)
+        for name in ("vector.extract_strided_slice", "vector.insert_strided_slice"):
+            assert not operations(vectorized, name)
     print("One forall, disjoint half stores, direct half loads, no vector slices")
 
 
@@ -228,6 +238,10 @@ def test_numerics():
     expected = transposed * cos + rotated * sin + bias
     for split in (False, True):
         execute(apply(split=split), [x, cos, sin, bias], expected)
+        reshaped = apply(RESHAPED, split=split)
+        if split:
+            assert not operations(reshaped, "tensor.concat")
+        execute(reshaped, [x, cos, sin, bias], expected)
     rounded = SOURCE.replace(
         "%ac = arith.mulf %a, %cv : f32",
         "%ac_full = arith.mulf %a, %cv : f32\n"

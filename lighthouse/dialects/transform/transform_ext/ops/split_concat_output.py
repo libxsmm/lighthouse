@@ -1,6 +1,10 @@
-"""Split concat-dependent output tiles without materializing the concat."""
+"""Split concat-dependent output tiles without materializing the concat.
+
+Static reshapes may regroup dimensions other than the concatenated axis.
+"""
 
 from dataclasses import dataclass
+from math import prod
 
 from mlir import ir
 from mlir.dialects import affine, ext, linalg, tensor, transform
@@ -64,6 +68,19 @@ def _partition(value, block):
         if partition is not None:
             dim, cuts = partition
             return list(op.permutation).index(dim), cuts
+    if isinstance(op, (tensor.ExpandShapeOp, tensor.CollapseShapeOp)):
+        partition = _partition(op.src, block)
+        if partition is not None:
+            dim, cuts = partition
+            groups = [[int(axis) for axis in group] for group in op.reassociation]
+            if isinstance(op, tensor.ExpandShapeOp):
+                group = groups[dim]
+                if len(group) == 1:
+                    return int(group[0]), cuts
+            else:
+                for i, group in enumerate(groups):
+                    if group == [dim]:
+                        return i, cuts
     if isinstance(op, linalg.GenericOp):
         maps = _generic_maps(op)
         if maps is None:
@@ -116,6 +133,36 @@ def _plan(value, offsets, sizes, block, cache):
     op = owner.opview
     if isinstance(op, tensor.EmptyOp):
         plan.kind = "empty"
+    elif isinstance(op, (tensor.ExpandShapeOp, tensor.CollapseShapeOp)):
+        source_shape = _shape(op.src)
+        if source_shape is None:
+            return None
+        groups = [[int(dim) for dim in group] for group in op.reassociation]
+        starts, extents = [], []
+        if isinstance(op, tensor.ExpandShapeOp):
+            for group in groups:
+                if len(group) == 1:
+                    starts.append(offsets[group[0]])
+                    extents.append(sizes[group[0]])
+                elif all(offsets[i] == 0 and sizes[i] == shape[i] for i in group):
+                    starts.append(0)
+                    extents.append(prod(sizes[i] for i in group))
+                else:
+                    return None
+        else:
+            for i, group in enumerate(groups):
+                if len(group) == 1:
+                    starts.append(offsets[i])
+                    extents.append(sizes[i])
+                elif offsets[i] == 0 and sizes[i] == shape[i]:
+                    starts.extend([0] * len(group))
+                    extents.extend(source_shape[j] for j in group)
+                else:
+                    return None
+        child = _plan(op.src, tuple(starts), tuple(extents), block, cache)
+        if child is None:
+            return None
+        plan.kind, plan.operands = "reshape", (child,)
     elif isinstance(op, tensor.ExtractSliceOp):
         if (
             len(_shape(op.source) or ()) != len(shape)
@@ -248,6 +295,14 @@ def _materialize(plan, cache):
             cloned.operands[i] = operand
         cloned.results[0].set_type(ty)
         value = cloned.results[0]
+    elif plan.kind == "reshape":
+        op = defining_op(plan.value).opview
+        source = _materialize(plan.operands[0], cache)
+        groups = [[int(dim) for dim in group] for group in op.reassociation]
+        if isinstance(op, tensor.ExpandShapeOp):
+            value = tensor.ExpandShapeOp(ty, source, groups, [], plan.sizes).result
+        else:
+            value = tensor.CollapseShapeOp(ty, source, groups).result
     else:
         offsets = [_offset(*o) if isinstance(o, tuple) else o for o in plan.offsets]
         if tuple(offsets) == (0,) * len(offsets) and _shape(plan.value) == plan.sizes:
