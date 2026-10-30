@@ -1,18 +1,23 @@
-# RUN: %PYTHON %S/kernel_bench.py --input %s --dump-kernel xegpu-wg | FileCheck %s --check-prefix=WG --implicit-check-not=memref.alloc --implicit-check-not=memref.copy --implicit-check-not=gpu.alloc
+# RUN: %PYTHON %S/kernel_bench.py --input %s --dump-kernel xegpu-wg | FileCheck %s --check-prefix=WG --implicit-check-not=memref.alloc --implicit-check-not=memref.copy --implicit-check-not=gpu.alloc --implicit-check-not=math.log
 # REQUIRES: torch, torch_mlir
 
 # WG: gpu.func @main_kernel
-# WG: scf.for %[[QUERY:[a-zA-Z0-9_]+]] =
+# WG-SAME: known_grid_size = array<i32: 32, 4, 4>
+# WG: %[[QUERY_BLOCK:[a-zA-Z0-9_]+]] = gpu.block_id z
+# WG: %[[QUERY:[a-zA-Z0-9_]+]] = arith.muli %[[QUERY_BLOCK]],
+# WG-NOT: scf.for
 # WG: vector.broadcast %[[QUERY]] : index
+# WG-NOT: scf.for
 # WG: scf.for %[[KEY:[a-zA-Z0-9_]+]] =
 # WG: vector.broadcast %[[KEY]] : index
 # WG: arith.cmpi sge, {{.*}} : vector<128x64xi64>
-# WG: math.log
+# WG-NOT: math.log
 # WG: xegpu.dpas
 # WG: vector.multi_reduction <maxnumf>
 # WG: math.exp
 # WG: xegpu.dpas
 # WG: xegpu.store_nd
+# WG-NOT: scf.for
 # WG-NOT: gpu.func
 
 import torch
@@ -40,9 +45,13 @@ class Model(nn.Module):
     torch.vtensor.literal on XPU. Supply an additive mask in Q's dtype, derived
     from the predicate rather than new_zeros (which hit empty.memory_format too).
     log maps allowed=1 to zero and blocked=0 to -inf without a tensor factory.
+    After vectorization, fold_log_of_bool replaces this workaround's logarithm
+    with a floating-point select.
 
     RoPE is intentionally not applied here. Q/K/V are taken as
     already-projected inputs, matching level1-97.
+    Query tiles are independent GPU blocks; only the K/V sequence is serial
+    within each block.
     """
 
     def __init__(self):
