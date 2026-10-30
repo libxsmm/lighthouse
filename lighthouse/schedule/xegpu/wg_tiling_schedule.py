@@ -61,9 +61,10 @@ def apply_subgraph_tiling(
     force_k_tile: int | None = None,
     device: str | None = None,
 ) -> ir.Operation:
-    """Partition attention, reduction, GEMM and elementwise subgraphs and tile each into
-    its own workgroup-parallel scf.forall, i.e. its own kernel.
+    """Partition attention, reduction, GEMM and elementwise subgraphs and tile
+    each into its own workgroup-parallel scf.forall, i.e. its own kernel.
 
+    Generic reshape preparation runs before any ownership tags or tiling.
     Attention is claimed first so softmax stays with its contractions.
     Normalization reductions are claimed before GEMM to materialize their
     outputs once, including when shared by multiple projections.
@@ -72,6 +73,7 @@ def apply_subgraph_tiling(
     are also supported. Fails silenceably if a linalg op is left unpartitioned.
     """
 
+    func = _prepare_iteration_spaces(func)
     with ir.InsertionPoint(transform.apply_patterns(func).patterns):
         structured.apply_patterns_linalg_swap_extract_slice_with_fill()
     func = transform_ext.tag_subgraphs(
@@ -153,7 +155,6 @@ def apply_subgraph_tiling(
             lh_transform.match_op(func, "linalg.matmul"), 0, silenceable=True
         )
         transform.yield_()
-    func = _prepare_attention_shapes(func, attention_ids)
     with lh_transform.foreach(attention_ids) as id:
         apply_attention_tiling(func, subgraph=id)
         transform.yield_()
@@ -269,21 +270,12 @@ def apply_reduction_tiling(
     return func
 
 
-def _prepare_attention_shapes(func, subgraphs=None):
-    """Expand only the selected attention iteration spaces before WG tiling."""
-    anytype = transform.AnyOpType.get()
-    transpose_ops = (
-        lh_transform.match_op(func, "linalg.transpose")
-        if subgraphs is None
-        else transform_ext.match_subgraph(
-            func, subgraphs, "linalg.transpose", role="body"
-        )
-    )
-    structured.structured_generalize(anytype, transpose_ops)
+def _prepare_iteration_spaces(func):
+    """Prepare generic iteration spaces before subgraph tagging and WG tiling."""
     for i in range(3):
         # Fold reshape ops by expansion and fold extract_slice into tensor.empty
         # Repeat until no more folding.
-        func = transform_ext.fold_reshape_ops_by_expansion(func, subgraph=subgraphs)
+        func = transform_ext.fold_reshape_ops_by_expansion(func)
         with ir.InsertionPoint(transform.apply_patterns(func).patterns):
             tensor.apply_patterns_tensor_fold_tensor_empty(fold_single_use_only=False)
     lh_transform.cleanup(func)
@@ -305,7 +297,7 @@ def apply_attention_tiling(
     """
     anytype = transform.AnyOpType.get()
     if subgraph is None:
-        func = _prepare_attention_shapes(func)
+        func = _prepare_iteration_spaces(func)
 
     def attention_ops(names):
         if subgraph is None:
