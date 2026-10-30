@@ -10,6 +10,7 @@ from mlir.passmanager import PassManager
 import lighthouse.dialects as lh_dialects
 import lighthouse.transform as lh_transform
 from lighthouse.dialects.transform import transform_ext
+from lighthouse.dialects.transform.transform_ext.utils import subgraph_analysis as sa
 from lighthouse.dialects.transform.transform_ext.utils.subgraph_analysis import (
     SUBGRAPH_ANCHOR_ATTR_NAME,
     SUBGRAPH_ID_ATTR_NAME,
@@ -156,7 +157,8 @@ def run(source, build):
 
 
 def tag_and_mark(func):
-    func = transform_ext.tag_subgraphs(func, kinds=["gemm", "elementwise"])
+    func = transform_ext.prepare_subgraphs(func, kinds=["gemm", "elementwise"])
+    transform_ext.tag_subgraphs(func, kinds=["gemm", "elementwise"])
     anchors = match(func, op_attrs={SUBGRAPH_ANCHOR_ATTR_NAME: ir.UnitAttr.get()})
     with lh_transform.foreach(anchors) as anchor:
         producers, consumers = transform_ext.get_subgraph_ops(anchor)
@@ -173,7 +175,7 @@ def test_tagging():
 
 
 # CHECK-LABEL: test_tagging
-# The shared fill is cloned for the first GEMM, the second claims the original.
+# Preparation isolates the shared fill; tagging only assigns ownership.
 # CHECK-NEXT: linalg.fill gemm 1 producer
 # CHECK-NEXT: linalg.fill gemm 2 producer
 # CHECK-NEXT: linalg.matmul gemm 1 producer
@@ -183,6 +185,91 @@ def test_tagging():
 # CHECK-NEXT: linalg.generic gemm 2 consumer
 # CHECK-NEXT: linalg.generic gemm 2 consumer
 # CHECK-NEXT: tensor.expand_shape gemm 2 consumer
+
+
+def test_phase_separation():
+    kinds = ["attention", "reduction", "gemm", "elementwise"]
+    shared_epilogue = (
+        SOURCE.replace(
+            "%r2: memref<4x64x256xf32>) {",
+            "%r2: memref<4x64x256xf32>) -> tensor<4x64x256xf32> {",
+        )
+        .replace(
+            "  %mm1 = linalg.matmul",
+            """  %be = tensor.empty() : tensor<4x64x256xf32>
+  %bias = linalg.fill ins(%zero : f32)
+    outs(%be : tensor<4x64x256xf32>) -> tensor<4x64x256xf32>
+  %mm1 = linalg.matmul""",
+        )
+        .replace(
+            "indexing_maps=[#id3,#id3,#id3]",
+            "indexing_maps=[#id3,#id3,#id3,#id3]",
+        )
+        .replace(
+            "ins(%neg, %heads : tensor<4x64x256xf32>, tensor<4x64x256xf32>)",
+            """ins(%neg, %heads, %bias : tensor<4x64x256xf32>,
+        tensor<4x64x256xf32>, tensor<4x64x256xf32>)""",
+        )
+        .replace("%b: f32, %o: f32", "%b: f32, %bias_value: f32, %o: f32")
+        .replace(
+            "%s = arith.mulf %a, %b : f32",
+            "%product = arith.mulf %a, %b : f32\n"
+            "    %s = arith.addf %product, %bias_value : f32",
+        )
+        .replace("  return\n", "  return %bias : tensor<4x64x256xf32>\n")
+    )
+    for source in (SOURCE, NORMALIZED, shared_epilogue):
+        module = ir.Module.parse(source)
+        func = module.body.operations[0]
+        block = func.body.blocks[0]
+        before = str(module)
+        original_ops = [op.operation for op in block.operations]
+        original_operands = [tuple(op.operands) for op in original_ops]
+        for matcher in sa.SUBGRAPH_MATCHERS.values():
+            for op in original_ops:
+                matcher(op, original_ops)
+        assert str(module) == before
+        assert [op.operation for op in block.operations] == original_ops
+        assert [tuple(op.operands) for op in original_ops] == original_operands
+
+        with schedule_boilerplate() as (schedule, sequence):
+            target = lh_transform.match_op(sequence.bodyTarget, "func.func")
+            transform_ext.prepare_subgraphs(target, kinds)
+            transform.yield_([])
+        schedule.body.operations[0].apply(module.operation)
+        assert module.operation.verify()
+        assert "transform_ext.subgraph_" not in str(module)
+        if source == shared_epilogue:
+            returned_bias = list(block.operations)[-1].operands[0]
+            assert len(list(returned_bias.uses)) == 1, (
+                "Epilogue-only producers must preserve their external users"
+            )
+        prepared = str(module)
+        prepared_ops = [op.operation for op in block.operations]
+        prepared_operands = [tuple(op.operands) for op in prepared_ops]
+        schedule.body.operations[0].apply(module.operation)
+        assert str(module) == prepared, "Preparation must be idempotent"
+
+        assert not sa.tag_subgraphs(block, kinds)
+        assert [op.operation for op in block.operations] == prepared_ops
+        assert [tuple(op.operands) for op in prepared_ops] == prepared_operands
+        tagged = str(module)
+        assert not sa.tag_subgraphs(block, kinds)
+        assert str(module) == tagged, "Tagging must be idempotent"
+        sa.clear_tags(func)
+        assert str(module) == prepared
+
+    module = ir.Module.parse(SOURCE)
+    before = str(module)
+    assert sa.tag_subgraphs(module.body.operations[0].body.blocks[0], kinds)
+    assert str(module) == before, "Missing isolation must not trigger cloning"
+    print(
+        "Matching is read-only; preparation is explicit; tagging only adds attributes"
+    )
+
+
+# CHECK-LABEL: test_phase_separation
+# CHECK-NEXT: Matching is read-only; preparation is explicit; tagging only adds attributes
 
 
 def test_untagged():
@@ -307,7 +394,8 @@ def test_shared_normalization_input():
     module = run(
         source,
         lambda func: transform_ext.tag_subgraphs(
-            func, ["reduction", "gemm", "elementwise"]
+            transform_ext.prepare_subgraphs(func, ["reduction", "gemm", "elementwise"]),
+            ["reduction", "gemm", "elementwise"],
         ),
     )
     add = operations(module, "arith.addf")[0]
@@ -487,8 +575,22 @@ func.func @projection(%a: tensor<256x64xf32>, %b: tensor<64x256xf32>)
   return %cast : tensor<2x128x4x64xf16>
 }
 """
+    unprepared = ir.Module.parse(source)
+    before = str(unprepared)
+    block = unprepared.body.operations[0].body.blocks[0]
+    original_ops = [op.operation for op in block.operations]
+    assert not sa.tag_subgraphs(block, ["gemm", "elementwise"])
+    sa.clear_tags(unprepared)
+    assert str(unprepared) == before
+    assert [op.operation for op in block.operations] == original_ops
+    (cast,) = operations(unprepared, "arith.truncf")
+    assert list(cast.parent.results[0].type.shape) == [2, 128, 4, 64]
     module = run(
-        source, lambda func: transform_ext.tag_subgraphs(func, ["gemm", "elementwise"])
+        source,
+        lambda func: transform_ext.tag_subgraphs(
+            transform_ext.prepare_subgraphs(func, ["gemm", "elementwise"]),
+            ["gemm", "elementwise"],
+        ),
     )
     (cast,) = operations(module, "arith.truncf")
     assert list(cast.parent.results[0].type.shape) == [256, 256]
@@ -510,6 +612,7 @@ with ir.Context(), ir.Location.unknown():
     lh_dialects.register_and_load()
     for test in (
         test_tagging,
+        test_phase_separation,
         test_untagged,
         test_tiling,
         test_numerics,

@@ -43,7 +43,11 @@ def test():
         payload = ir.Module.parse(PAYLOAD)
         with schedule_boilerplate() as (schedule, named_sequence):
             func = lh_transform.match_op(named_sequence.bodyTarget, "func.func")
-            transform_ext.tag_subgraphs(func, kinds=["gemm", "elementwise"])
+            assert (
+                transform_ext.tag_subgraphs(func, kinds=["gemm", "elementwise"]) is None
+            )
+            tag_op = list(named_sequence.regions[0].blocks[0].operations)[-1]
+            assert len(tag_op.results) == 0
             transform.yield_()
         schedule.body.operations[0].apply(payload.operation)
         print(payload)
@@ -58,7 +62,7 @@ def test():
 test()
 
 
-def test_handle_invalidation():
+def test_handle_preservation():
     with ir.Context(), ir.Location.unknown():
         lh_dialects.register_and_load()
         payload = ir.Module.parse(PAYLOAD)
@@ -66,6 +70,26 @@ def test_handle_invalidation():
             func = lh_transform.match_op(sequence.bodyTarget, "func.func")
             members = lh_transform.match_op(func, "linalg.generic")
             transform_ext.tag_subgraphs(func, kinds=["gemm", "elementwise"])
+            transform.annotate(members, "test.preserved")
+            transform.yield_()
+        schedule.body.operations[0].apply(payload.operation)
+        assert "test.preserved" in str(payload)
+    print("Annotation-only tagging preserves existing operation handles")
+
+
+# CHECK: Annotation-only tagging preserves existing operation handles
+
+test_handle_preservation()
+
+
+def test_preparation_invalidates_handles():
+    with ir.Context(), ir.Location.unknown():
+        lh_dialects.register_and_load()
+        payload = ir.Module.parse(PAYLOAD)
+        with schedule_boilerplate() as (schedule, sequence):
+            func = lh_transform.match_op(sequence.bodyTarget, "func.func")
+            members = lh_transform.match_op(func, "linalg.generic")
+            transform_ext.prepare_subgraphs(func, ["gemm", "elementwise"])
             transform.annotate(members, "test.stale")
             transform.yield_()
         try:
@@ -73,13 +97,13 @@ def test_handle_invalidation():
         except ValueError as error:
             assert "invalidated" in str(error), str(error)
         else:
-            raise AssertionError("Normalization must invalidate nested handles")
-    print("Subgraph normalization invalidates nested operation handles")
+            raise AssertionError("Preparation must invalidate nested handles")
+    print("Only structural preparation invalidates nested operation handles")
 
 
-# CHECK: Subgraph normalization invalidates nested operation handles
+# CHECK: Only structural preparation invalidates nested operation handles
 
-test_handle_invalidation()
+test_preparation_invalidates_handles()
 
 
 def test_scope():

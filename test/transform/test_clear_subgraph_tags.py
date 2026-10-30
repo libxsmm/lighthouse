@@ -36,7 +36,7 @@ def test():
         payload = ir.Module.parse(PAYLOAD)
         with schedule_boilerplate() as (schedule, named_sequence):
             func = lh_transform.match_op(named_sequence.bodyTarget, "func.func")
-            func = transform_ext.tag_subgraphs(func, kinds=["elementwise"])
+            transform_ext.tag_subgraphs(func, kinds=["elementwise"])
             transform_ext.clear_subgraph_tags(func)
             transform.yield_()
         schedule.body.operations[0].apply(payload.operation)

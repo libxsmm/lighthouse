@@ -8,6 +8,9 @@ are either producers of the anchor (fused into its loop) or consumers of it
 
 Matchers run in a fixed order and only claim untagged ops, so the more
 demanding kinds (e.g. GEMMs) take precedence over generic elementwise groups.
+They never modify IR. An optional claim predicate lets preparation reserve
+candidate groups without attaching attributes; tagging uses the same matchers
+after preparation has isolated shared producers.
 """
 
 from collections.abc import Callable, Iterable
@@ -21,9 +24,12 @@ from lighthouse.dialects.transform.transform_ext.ops.filter_elementwise import (
 from lighthouse.dialects.transform.transform_ext.ops.filter_reduction_ops import (
     is_reduction_op,
 )
-from lighthouse.utils.mlir import indexing_maps, opview
+from lighthouse.utils.mlir import opview
 from lighthouse.dialects.transform.transform_ext.ops.filter_contraction_ops import (
     is_contraction_op,
+)
+from lighthouse.dialects.transform.transform_ext.utils.ir_rewrite import (
+    _ancestor_in_block,
 )
 
 SUBGRAPH_KIND_ATTR_NAME = "transform_ext.subgraph_kind"
@@ -108,106 +114,20 @@ def _is_elementwise_linalg(op: ir.Operation) -> bool:
     return _is_linalg(op) and is_elementwise(op)
 
 
-def _is_cast_generic(op: ir.Operation) -> bool:
-    if op.name != "linalg.generic" or len(op.results) != 1:
-        return False
-    generic = op.opview
-    body = generic.regions[0].blocks[0]
-    operations = list(body.operations)
-    return (
-        len(generic.inputs) == 1
-        and len(generic.outputs) == 1
-        and len(operations) == 2
-        and operations[0].name in ("arith.extf", "arith.truncf")
-        and list(operations[0].operands) == [body.arguments[0]]
-        and operations[1].name == "linalg.yield"
-        and list(operations[1].operands) == list(operations[0].results)
-        and all(
-            mapping == ir.AffineMap.get_identity(mapping.n_dims)
-            for mapping in indexing_maps(generic)
-        )
-    )
-
-
-def _fold_gemm_cast_reshape(op: ir.Operation) -> None:
-    """Keep a projection's pointwise cast in its 2D GEMM iteration space."""
-    if is_tagged(op) or len(op.results) != 1:
-        return
-    source_type = op.results[0].type
-    if (
-        not isinstance(source_type, ir.RankedTensorType)
-        or source_type.rank != 2
-        or source_type.encoding is not None
-        or any(size <= 0 for size in source_type.shape)
-    ):
-        return
-    for reshape in list(_users(op)):
-        if reshape.name != "tensor.expand_shape" or is_tagged(reshape):
-            continue
-        if len(list(reshape.opview.reassociation)[-1]) == 1:
-            continue
-        for cast in list(_users(reshape)):
-            if (
-                is_tagged(cast)
-                or not _is_cast_generic(cast)
-                or cast.operands[0] != reshape.results[0]
-            ):
-                continue
-            result_type = ir.RankedTensorType(cast.results[0].type)
-            if result_type.encoding is not None or any(
-                size <= 0 for size in result_type.shape
-            ):
-                continue
-            shape = source_type.shape
-            with ir.InsertionPoint(reshape), cast.location:
-                empty = tensor.EmptyOp(shape, result_type.element_type)
-                folded = cast.clone()
-                folded.operands[0] = op.results[0]
-                folded.operands[1] = empty.result
-                folded.results[0].set_type(empty.result.type)
-                identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(2))
-                folded.attributes["indexing_maps"] = ir.ArrayAttr.get(
-                    [identity, identity]
-                )
-                folded.attributes["iterator_types"] = ir.ArrayAttr.get(
-                    list(cast.attributes["iterator_types"])[:2]
-                )
-                expanded = tensor.ExpandShapeOp(
-                    result_type,
-                    folded.results[0],
-                    reshape.opview.reassociation,
-                    [],
-                    result_type.shape,
-                )
-            cast.results[0].replace_all_uses_with(expanded.result)
-            cast.erase()
-        if not _users(reshape):
-            reshape.erase()
-
-
-def _clone_for(producer: ir.Operation, members: list) -> ir.Operation:
-    """Clone `producer` and redirect the uses by `members` to the clone."""
-    with ir.InsertionPoint(producer):
-        clone = producer.clone()
-    for old, new in zip(producer.results, clone.results):
-        for use in [u for u in old.uses if u.owner.operation in members]:
-            use.owner.operands[use.operand_number] = new
-    return clone
-
-
-def _match_gemm(op: ir.Operation, block_ops) -> list[tuple[list, ir.Operation]]:
+def _match_gemm(
+    op: ir.Operation, block_ops, is_claimed=is_tagged
+) -> list[tuple[list, ir.Operation]]:
     """GEMM subgraph: matmul, its single-use elementwise epilogue chain, and the
     elementwise producers (fill, transposes, broadcasts, ...) feeding it.
-    Producers that also have users outside the subgraph are cloned, i.e.
-    recomputed per subgraph as tile-and-fuse would do. The anchor is the last
-    op of the epilogue chain. Token-only expansions and elementwise epilogue DAGs
-    are also claimed forward. At a join, the last available branch owns the
+    Producers are collected without cloning or redirecting uses. The anchor is
+    the last op of the epilogue chain. Token-only expansions and elementwise
+    epilogue DAGs are also claimed forward. At a join, the last available branch owns the
     epilogue: external computations must precede the root matmul. Local
     elementwise setup may follow it if its inputs are available. This
     keeps parallel projections separate and their join before the next GEMM.
     Collapses into a following GEMM remain outside to avoid tile-local
     reshape copies during bufferization."""
-    if op.name != "linalg.matmul" or is_tagged(op):
+    if op.name != "linalg.matmul" or is_claimed(op):
         return []
     members = [op]
     anchor = op
@@ -223,7 +143,7 @@ def _match_gemm(op: ir.Operation, block_ops) -> list[tuple[list, ir.Operation]]:
             or block_ops.index(producer) <= root_position
         ):
             return True
-        if not is_tagged(producer) and _is_elementwise_linalg(producer):
+        if not is_claimed(producer) and _is_elementwise_linalg(producer):
             inputs = (
                 producer.opview.inputs
                 if producer.name == "linalg.generic"
@@ -243,7 +163,7 @@ def _match_gemm(op: ir.Operation, block_ops) -> list[tuple[list, ir.Operation]]:
         user = uses[0].owner.operation
         if (
             user not in block_ops
-            or is_tagged(user)
+            or is_claimed(user)
             or not _is_elementwise_linalg(user)
             or not available(user)
         ):
@@ -252,7 +172,7 @@ def _match_gemm(op: ir.Operation, block_ops) -> list[tuple[list, ir.Operation]]:
         anchor = user
 
     for user in block_ops[block_ops.index(anchor) + 1 :]:
-        if is_tagged(user) or not any(
+        if is_claimed(user) or not any(
             _producer(value) in members
             for value in user.operands
             if _producer(value) is not None
@@ -281,12 +201,10 @@ def _match_gemm(op: ir.Operation, block_ops) -> list[tuple[list, ir.Operation]]:
                 producer is None
                 or producer not in block_ops
                 or producer in members
-                or is_tagged(producer)
+                or is_claimed(producer)
                 or not _is_elementwise_linalg(producer)
             ):
                 continue
-            if any(user not in members for user in _users(producer)):
-                producer = _clone_for(producer, members)
             members.append(producer)
             worklist.append(producer)
     return [(members, anchor)]
@@ -304,7 +222,7 @@ def _forward_closure(root: ir.Operation, members: list) -> list:
 
 
 def _match_elementwise(
-    op: ir.Operation, block_ops: list
+    op: ir.Operation, block_ops: list, is_claimed=is_tagged
 ) -> list[tuple[list, ir.Operation]]:
     """Elementwise subgraphs: connected components of untagged elementwise
     linalg ops and the static data movement ops between them (reshapes, slices,
@@ -315,7 +233,7 @@ def _match_elementwise(
     def candidate(o):
         return (
             o in block_ops
-            and not is_tagged(o)
+            and not is_claimed(o)
             and (_is_elementwise_linalg(o) or isinstance(o.opview, _DATA_MOVEMENT_OPS))
         )
 
@@ -345,22 +263,22 @@ def _match_elementwise(
 
 
 def _match_reduction(
-    op: ir.Operation, block_ops: list
+    op: ir.Operation, block_ops: list, is_claimed=is_tagged
 ) -> list[tuple[list, ir.Operation]]:
     """Claim normalization without crossing shared input materializations.
 
     Follow reduction consumers first, then absorb producers only when all their
     uses are already local. A preceding residual also used after normalization
     stays outside; the square/cast chain used only by normalization stays inside.
-    Shared accumulator fills are cloned, not treated as kernel boundaries.
+    Shared accumulator fills are included for preparation to isolate.
     """
-    if op.name != "linalg.generic" or not is_reduction_op(op) or is_tagged(op):
+    if op.name != "linalg.generic" or not is_reduction_op(op) or is_claimed(op):
         return []
 
     def candidate(value):
         return (
             value in block_ops
-            and not is_tagged(value)
+            and not is_claimed(value)
             and (_is_elementwise_linalg(value) or value == op)
         )
 
@@ -395,12 +313,7 @@ def _match_reduction(
         for u in _users(member)
     ):
         return []
-    for i, member in enumerate(members):
-        if member.name == "linalg.fill" and any(
-            user not in members for user in _users(member)
-        ):
-            members[i] = _clone_for(member, members)
-    order = {value.operation: i for i, value in enumerate(op.block.operations)}
+    order = {value: i for i, value in enumerate(block_ops)}
     members.sort(key=order.__getitem__)
     return [(members, anchor)]
 
@@ -417,10 +330,10 @@ def _contains(op, names):
     return bool(found)
 
 
-def _match_attention(root, block_ops):
+def _match_attention(root, block_ops, is_claimed=is_tagged):
     """Claim a closed QK-softmax-PV DAG, stopping at projection/RoPE inputs."""
     if (
-        is_tagged(root)
+        is_claimed(root)
         or root.name not in ("linalg.generic", "linalg.batch_matmul")
         or not is_contraction_op(root)
     ):
@@ -438,7 +351,7 @@ def _match_attention(root, block_ops):
             if (
                 user in block_ops
                 and user not in members
-                and not is_tagged(user)
+                and not is_claimed(user)
                 and (
                     (_is_linalg(user) and user.name != "linalg.matmul")
                     or user.name in movement
@@ -460,7 +373,7 @@ def _match_attention(root, block_ops):
         return []
 
     def prologue(op):
-        if is_tagged(op):
+        if is_claimed(op):
             return False
         if op.name in movement or op.name in (
             "tensor.empty",
@@ -507,10 +420,6 @@ def _match_attention(root, block_ops):
                 members.append(producer)
                 worklist.append(producer)
     members.sort(key=block_ops.index)
-    # Shared attention prologues are recomputed without claiming their other uses.
-    for i, member in enumerate(members):
-        if member != sink and any(u not in members for u in _users(member)):
-            members[i] = _clone_for(member, members)
     anchor = sink
     while anchor.name in movement:
         source = _producer(anchor.operands[0])
@@ -531,27 +440,52 @@ SUBGRAPH_MATCHERS: dict[str, Callable] = {
 def tag_subgraphs(block: ir.Block, kinds: Iterable[str]) -> list[ir.Operation]:
     """Tag the subgraphs of `kinds` (in order) among the ops of `block`.
 
-    Returns the linalg ops of `block` that are left untagged."""
-    kinds = tuple(kinds)
-    if "gemm" in kinds:
-        for op in list(block.operations):
-            if op.name == "linalg.matmul":
-                _fold_gemm_cast_reshape(op.operation)
+    Only attributes are changed. Shared producers must have been isolated by
+    preparation. Returns unsupported/shared ops without tagging if isolation is
+    needed; otherwise returns the linalg ops left untagged."""
+    block_ops = [op.operation for op in block.operations]
+    claimed = {op for op in block_ops if is_tagged(op)}
+    groups = []
+    for kind in kinds:
+        for op in block_ops:
+            for members, anchor in SUBGRAPH_MATCHERS[kind](
+                op, block_ops, claimed.__contains__
+            ):
+                shared = (
+                    shared_producers(members, anchor) if kind != "elementwise" else []
+                )
+                if shared:
+                    return shared
+                groups.append((members, anchor, kind))
+                claimed.update(members)
     next_id = 1 + max(
         (subgraph_id(o) or 0 for o in block.operations),
         default=0,
     )
-    for kind in kinds:
-        matcher = SUBGRAPH_MATCHERS[kind]
-        for op in list(block.operations):
-            block_ops = [o.operation for o in block.operations]
-            for members, anchor in matcher(op.operation, block_ops):
-                tag(members, anchor, kind, next_id)
-                next_id += 1
+    for members, anchor, kind in groups:
+        tag(members, anchor, kind, next_id)
+        next_id += 1
     return [
         o.operation
         for o in block.operations
         if _is_linalg(o.operation) and not is_tagged(o)
+    ]
+
+
+def shared_producers(members: list, anchor: ir.Operation) -> list[ir.Operation]:
+    """External-use members feeding the anchor or its forward consumers.
+
+    The anchor and forward consumers may expose additional results; those uses
+    do not request producer recomputation.
+    """
+    consumers = set(_forward_closure(anchor, members))
+    return [
+        op
+        for op in members
+        if op not in consumers
+        and any(
+            _ancestor_in_block(user, anchor.block) not in members for user in _users(op)
+        )
     ]
 
 
@@ -585,6 +519,7 @@ __all__ = [
     "SUBGRAPH_MATCHERS",
     "clear_tags",
     "is_tagged",
+    "shared_producers",
     "subgraph_id",
     "subgraph_members",
     "tag_subgraphs",
