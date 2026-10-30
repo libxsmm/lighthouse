@@ -443,11 +443,13 @@ def wg_tiling_schedule(
             )
             transform.yield_([func])
         with alt.region(1) as func:
+            # TODO legacy path, remove. apply_subgraph_tiling should be used instead.
             func = apply_attention_tiling(
                 func, force_wg_tile=wg_tile, force_reduction_tile=reduction_tile
             )
             transform.yield_([func])
         with alt.region(2) as func:
+            # TODO legacy path, remove. apply_subgraph_tiling should be used instead.
             func = apply_reduction_tiling(
                 func,
                 force_wg_tile=wg_tile,
