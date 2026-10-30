@@ -39,6 +39,36 @@ def _zero():
     return ir.AffineExpr.get_constant(0)
 
 
+def _bounded_offset(expr, bounds):
+    """Simplify reshape div/mod offsets using the forall IV bounds."""
+    expr = expr.maybe_downcast()
+    if isinstance(expr, ir.AffineConstantExpr):
+        return expr, expr.value, expr.value
+    if isinstance(expr, ir.AffineDimExpr):
+        lower, upper = bounds[expr.position]
+        return expr, lower, upper
+    lhs, lo, hi = _bounded_offset(expr.lhs, bounds)
+    rhs, rlo, rhi = _bounded_offset(expr.rhs, bounds)
+    if isinstance(expr, ir.AffineAddExpr):
+        return lhs + rhs, lo + rlo, hi + rhi
+    if isinstance(expr, ir.AffineMulExpr):
+        products = [a * b for a in (lo, hi) for b in (rlo, rhi)]
+        return lhs * rhs, min(products), max(products)
+    if isinstance(expr, ir.AffineFloorDivExpr) and rlo == rhi and rlo > 0:
+        lower, upper = lo // rlo, hi // rlo
+        value = (
+            ir.AffineExpr.get_constant(lower)
+            if lower == upper
+            else ir.AffineExpr.get_floor_div(lhs, rhs)
+        )
+        return value, lower, upper
+    if isinstance(expr, ir.AffineModExpr) and rlo == rhi and rlo > 0:
+        if lo // rlo == hi // rlo:
+            return lhs - (lo // rlo) * rlo, lo % rlo, hi % rlo
+        return lhs % rlo, 0, rlo - 1
+    raise ValueError(f"Unsupported tile offset expression: {expr}")
+
+
 def _groups(op):
     return [[int(dim) for dim in group] for group in op.reassociation]
 
@@ -352,6 +382,14 @@ def _plan(loop, allowed=None):
         if image is None:
             return None
         tile, operand_tiles = image
+        bounds = [
+            (int(lower), int(upper) - 1)
+            for lower, upper in zip(loop.staticLowerBound, loop.staticUpperBound)
+        ]
+        tile = Tile(
+            tuple(_bounded_offset(offset, bounds)[0] for offset in tile.offsets),
+            tile.sizes,
+        )
         tiles[candidate.results[0]] = tile
         operands[candidate.operation] = operand_tiles
         nodes.append(candidate)

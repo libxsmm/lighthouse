@@ -10,6 +10,9 @@ from mlir.passmanager import PassManager
 import lighthouse.dialects as lh_dialects
 import lighthouse.transform as lh_transform
 from lighthouse.dialects.transform import transform_ext
+from lighthouse.dialects.transform.transform_ext.ops.fuse_forall_epilogue import (
+    _bounded_offset,
+)
 from lighthouse.execution.runner import Runner
 from lighthouse.schedule import schedule_boilerplate
 
@@ -379,6 +382,25 @@ func.func @heads(%x: tensor<2x2x4x4xf32>) -> tensor<8x8xf32> {
 # CHECK: Rank-reduced tiles fuse through head merging into nested consumers
 
 
+def test_grouped_head_offsets():
+    kv_head = ir.AffineExpr.get_dim(0)
+    group = ir.AffineExpr.get_dim(1)
+    flattened = kv_head * 4 + group
+    bounds = [(0, 7), (0, 3)]
+    restored_head = (
+        ir.AffineExpr.get_floor_div(flattened, ir.AffineExpr.get_constant(4)) % 8
+    )
+    restored_group = flattened % 4
+    assert _bounded_offset(restored_head, bounds) == (kv_head, 0, 7)
+    assert _bounded_offset(restored_group, bounds) == (group, 0, 3)
+    # Do not discard mod when the IV crosses more than one group.
+    assert _bounded_offset(group % 4, [(0, 7), (0, 7)])[0] == group % 4
+    print("Grouped-head collapse/expand offsets agree within forall bounds")
+
+
+# CHECK: Grouped-head collapse/expand offsets agree within forall bounds
+
+
 with ir.Context(), ir.Location.unknown():
     lh_dialects.register_and_load()
     test_structure()
@@ -386,3 +408,4 @@ with ir.Context(), ir.Location.unknown():
     test_external_users()
     test_numerics()
     test_rank_reduced_nested_consumer()
+    test_grouped_head_offsets()
