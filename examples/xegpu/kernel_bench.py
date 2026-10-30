@@ -488,7 +488,16 @@ def infer_params_and_lower(
     kernel_metadata.update(func_metadata)
 
     matmuls = [layer for layer in func_metadata["layers"] if layer["kind"] == "matmul"]
-    if enable_tuning and len(matmuls) == 1 and schedule_kind == "mlp":
+    mixed_kernel_graph = bool(matmuls) and any(
+        layer["kind"] in ("reduction", "batch_matmul")
+        for layer in func_metadata["layers"]
+    )
+    if (
+        enable_tuning
+        and len(matmuls) == 1
+        and schedule_kind == "mlp"
+        and not mixed_kernel_graph
+    ):
         # runtime tuning for matmul kernels
         if os.path.isfile(params_cache_json):
             print(f"Loading cached parameters from {params_cache_json}")
@@ -536,10 +545,6 @@ def infer_params_and_lower(
                 print(f"  {k}: {v}")
 
     # GEMM overrides must not leak into normalization or attention kernels.
-    mixed_kernel_graph = bool(matmuls) and any(
-        layer["kind"] in ("reduction", "batch_matmul")
-        for layer in func_metadata["layers"]
-    )
     lowered_mod = lower_to_llvm(
         mod=mod,
         schedule_kind=schedule_kind,
@@ -874,7 +879,7 @@ def lower_and_execute_benchmark(
         stop_at_stage=stop_at_stage,
         params_cache_json=f"kb_params_level{level}-{id}.json",
         dump_parameters=dump_parameters,
-        enable_tuning=False,  # execute,
+        enable_tuning=execute,
         verbose=verbose,
     )
     backend = gpu_backend(
