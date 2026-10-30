@@ -96,8 +96,8 @@ def apply(source):
     module = ir.Module.parse(source)
     assert module.operation.verify()
     with schedule_boilerplate() as (schedule, sequence):
-        transform_ext.fold_tensor_vector_transfers(sequence.bodyTarget)
-        lh_transform.cleanup(sequence.bodyTarget)
+        target = transform_ext.fold_tensor_vector_transfers(sequence.bodyTarget)
+        lh_transform.cleanup(target)
         transform.yield_([])
     schedule.body.operations[0].apply(module.operation)
     assert module.operation.verify()
@@ -214,6 +214,25 @@ func.func @slice(%input: tensor<1x4x8xf32>, %index: index) -> vector<2x2xf32> {
 # CHECK: Native subset folding handles rank reduction and dynamic read indices
 
 
+def test_handle_invalidation():
+    module = ir.Module.parse(SUBSET)
+    with schedule_boilerplate() as (schedule, sequence):
+        reads = lh_transform.match_op(sequence.bodyTarget, "vector.transfer_read")
+        transform_ext.fold_tensor_vector_transfers(sequence.bodyTarget)
+        transform.annotate(reads, "test.stale")
+        transform.yield_([])
+    try:
+        schedule.body.operations[0].apply(module.operation)
+    except ValueError as error:
+        assert "invalidated" in str(error), str(error)
+    else:
+        raise AssertionError("Rewriting must invalidate nested handles")
+    print("Transfer folding invalidates handles to rewritten nested operations")
+
+
+# CHECK: Transfer folding invalidates handles to rewritten nested operations
+
+
 def test_numerics():
     module = apply(SOURCE)
     PassManager.parse(
@@ -254,4 +273,5 @@ with ir.Context(), ir.Location.unknown():
     test_structure()
     test_rejections()
     test_native_subset_folding()
+    test_handle_invalidation()
     test_numerics()

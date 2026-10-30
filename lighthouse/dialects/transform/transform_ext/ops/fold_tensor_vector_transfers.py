@@ -21,6 +21,8 @@ class FoldTensorVectorTransfersOp(
     write/insert-slice forwarding between custom folding rounds, including
     reads introduced by reshape and concat forwarding. Targets must be isolated
     from above, as required by the pass manager.
+    Consumes target handles and invalidates nested handles; reacquire them from
+    the returned containers after rewriting.
 
     Upstreaming plan:
       1. Extend native read-after-write forwarding to handle contained reads.
@@ -55,7 +57,7 @@ class FoldTensorVectorTransfersOp(
         @staticmethod
         def get_effects(op):
             return (
-                transform.only_reads_handle(op.op_operands)
+                transform.consumes_handle(op.op_operands)
                 + transform.produces_handle(op.results)
                 + transform.modifies_payload()
             )
