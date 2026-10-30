@@ -1,4 +1,4 @@
-# RUN: %PYTHON %S/kernel_bench.py --input %s --dump-kernel xegpu-wg | FileCheck %s --check-prefix=WG --implicit-check-not=memref.alloc --implicit-check-not=memref.copy
+# RUN: %PYTHON %S/kernel_bench.py --input %s --dump-kernel xegpu-wg | FileCheck %s --check-prefix=WG --implicit-check-not=memref.alloc --implicit-check-not=memref.copy --implicit-check-not=math.log
 # REQUIRES: torch, torch_mlir
 
 """Llama 3.2 1B prefill attention block, including output projection/residual.
@@ -78,7 +78,7 @@ def get_init_inputs():
 # WG-COUNT-6: gpu.func @main_kernel
 # WG: gpu.func @main_kernel
 # WG: arith.cmpi sge
-# WG: math.log
+# WG-NOT: math.log
 # WG: xegpu.dpas
 # WG: math.exp
 # WG: xegpu.dpas
