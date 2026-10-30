@@ -16,7 +16,10 @@ from lighthouse.dialects.transform.transform_ext.utils.subgraph_analysis import 
     SUBGRAPH_KIND_ATTR_NAME,
 )
 from lighthouse.execution.runner import Runner
-from lighthouse.ingress.mlir_gen import generate_gpu_matmul_payload
+from lighthouse.ingress.mlir_gen import (
+    generate_gpu_matmul_payload,
+    generate_gpu_mlp_payload,
+)
 from lighthouse.pipeline.helper import match
 from lighthouse.schedule import schedule_boilerplate
 from lighthouse.schedule.xegpu import cleanup_schedule
@@ -382,6 +385,83 @@ def test_late_bias_relu_setup():
 # CHECK-NEXT: Late bias/ReLU setup fuses into one GEMM kernel and matches NumPy
 
 
+def test_mlp_accumulators():
+    rng = np.random.default_rng(19)
+    for layers in (1, 3):
+        x = rng.integers(-1, 2, size=(256, 256)).astype(np.float32)
+        weights = [
+            rng.integers(-1, 2, size=(256, 256)).astype(np.float32)
+            for _ in range(layers)
+        ]
+        biases = [
+            rng.integers(-1, 2, size=256).astype(np.float32) for _ in range(layers)
+        ]
+        initial = rng.integers(-3, 4, size=(256, 256)).astype(np.float32)
+        for accumulate in (False, True):
+            module = generate_gpu_mlp_payload(
+                func_name="payload",
+                batch_size=256,
+                input_size=256,
+                output_size=256,
+                hidden_layer_sizes=[256] * (layers - 1),
+                ab_type=ir.F32Type.get(),
+                acc_type=ir.F32Type.get(),
+                bias_type=ir.F32Type.get(),
+                result_type=ir.F32Type.get(),
+                transpose_a=False,
+                transpose_b=False,
+                has_bias=True,
+                has_relu=True,
+                accumulate_c=accumulate,
+            )
+            cleanup = cleanup_schedule()
+            cleanup.body.operations[0].apply(module.operation)
+            module = run(str(module), tile)
+            loops = [
+                op for op in operations(module, "scf.forall") if op.name == "scf.forall"
+            ]
+            assert len(loops) == layers
+            for i, loop in enumerate(loops):
+                (matmul,) = operations(loop, "linalg.matmul")
+                k_loop = matmul.parent
+                assert k_loop.name == "scf.for"
+                initializer = k_loop.operands[3].owner
+                assert initializer.name == (
+                    "tensor.extract_slice"
+                    if accumulate and i == layers - 1
+                    else "linalg.fill"
+                )
+            PassManager.parse(
+                "builtin.module(empty-tensor-to-alloc-tensor,"
+                "one-shot-bufferize{bufferize-function-boundaries "
+                "function-boundary-type-conversion=identity-layout-map},"
+                "scf-forall-to-for,buffer-deallocation-pipeline,"
+                "convert-linalg-to-loops,expand-strided-metadata,lower-affine,"
+                "convert-scf-to-cf,convert-math-to-llvm)"
+            ).run(module.operation)
+            Runner.make_function_callable(module, "payload")
+            PassManager.parse(
+                "builtin.module(finalize-memref-to-llvm,convert-to-llvm,"
+                "reconcile-unrealized-casts)"
+            ).run(module.operation)
+            output = initial.copy()
+            Runner(module).execute("payload", [output, x, *weights, *biases])
+            expected = x
+            for i, (weight, bias) in enumerate(zip(weights, biases)):
+                expected = expected @ weight
+                if accumulate and i == layers - 1:
+                    expected += initial
+                expected += bias
+                if i < layers - 1:
+                    expected = np.maximum(expected, 0)
+            np.testing.assert_array_equal(output, expected)
+    print("MLP hidden accumulators start at zero; only the final output accumulates")
+
+
+# CHECK-LABEL: test_mlp_accumulators
+# CHECK-NEXT: MLP hidden accumulators start at zero; only the final output accumulates
+
+
 with ir.Context(), ir.Location.unknown():
     lh_dialects.register_and_load()
     for test in (
@@ -392,6 +472,7 @@ with ir.Context(), ir.Location.unknown():
         test_mixed_reduction,
         test_shared_normalization_input,
         test_late_bias_relu_setup,
+        test_mlp_accumulators,
     ):
         print(test.__name__)
         test()
