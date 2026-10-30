@@ -1,5 +1,5 @@
 # RUN: %PYTHON %S/kernel_bench.py --input %s --input-shapes 1x8x2048 8x64 8x64 --dump-kernel imported | FileCheck %s
-# RUN: %PYTHON %S/kernel_bench.py --input %s --dump-kernel xegpu-wg | FileCheck %s --check-prefix=WG --implicit-check-not=memref.alloc --implicit-check-not=memref.copy --implicit-check-not=gpu.alloc
+# RUN: %PYTHON %S/kernel_bench.py --input %s --dump-kernel xegpu-wg | FileCheck %s --check-prefix=WG --implicit-check-not=memref.alloc --implicit-check-not=memref.copy --implicit-check-not=gpu.alloc --implicit-check-not=math.log
 # REQUIRES: torch, torch_mlir
 
 # CHECK-LABEL: func.func private @main(
@@ -115,7 +115,7 @@ def get_init_inputs():
 # WG-COUNT-6: gpu.func @main_kernel
 # WG: gpu.func @main_kernel
 # WG: arith.cmpi sge
-# WG: math.log
+# WG-NOT: math.log
 # WG: xegpu.dpas
 # WG: math.exp
 # WG: xegpu.dpas
