@@ -64,7 +64,8 @@ def apply_subgraph_tiling(
     """Partition attention, reduction, GEMM and elementwise subgraphs and tile
     each into its own workgroup-parallel scf.forall, i.e. its own kernel.
 
-    Generic reshape preparation runs before any ownership tags or tiling.
+    Reshape preparation, cast normalization and shared-producer isolation run
+    before annotation-only tagging or tiling.
     Attention is claimed first so softmax stays with its contractions.
     Normalization reductions are claimed before GEMM to materialize their
     outputs once, including when shared by multiple projections.
@@ -76,9 +77,9 @@ def apply_subgraph_tiling(
     func = _prepare_iteration_spaces(func)
     with ir.InsertionPoint(transform.apply_patterns(func).patterns):
         structured.apply_patterns_linalg_swap_extract_slice_with_fill()
-    func = transform_ext.tag_subgraphs(
-        func, kinds=["attention", "reduction", "gemm", "elementwise"]
-    )
+    kinds = ["attention", "reduction", "gemm", "elementwise"]
+    func = transform_ext.prepare_subgraphs(func, kinds)
+    transform_ext.tag_subgraphs(func, kinds)
 
     with lh_transform.foreach(_subgraph_anchors(func, "reduction")) as anchor:
         # Standalone reductions keep the existing schedule and its overrides.
