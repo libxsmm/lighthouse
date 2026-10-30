@@ -118,7 +118,8 @@ def _match_gemm(op: ir.Operation, block_ops) -> list[tuple[list, ir.Operation]]:
     recomputed per subgraph as tile-and-fuse would do. The anchor is the last
     op of the epilogue chain. Token-only expansions and elementwise epilogue DAGs
     are also claimed forward. At a join, the last available branch owns the
-    epilogue: no external input may be defined after the root matmul. This
+    epilogue: external computations must precede the root matmul. Local
+    elementwise setup may follow it if its inputs are available. This
     keeps parallel projections separate and their join before the next GEMM.
     Collapses into a following GEMM remain outside to avoid tile-local
     reshape copies during bufferization."""
@@ -129,15 +130,27 @@ def _match_gemm(op: ir.Operation, block_ops) -> list[tuple[list, ir.Operation]]:
 
     root_position = block_ops.index(op)
 
-    def available(user):
-        inputs = user.opview.inputs if user.name == "linalg.generic" else user.operands
-        return all(
+    def available_input(value):
+        producer = _producer(value)
+        if (
             producer is None
             or producer in members
             or producer not in block_ops
             or block_ops.index(producer) <= root_position
-            for producer in map(_producer, inputs)
-        )
+        ):
+            return True
+        if not is_tagged(producer) and _is_elementwise_linalg(producer):
+            inputs = (
+                producer.opview.inputs
+                if producer.name == "linalg.generic"
+                else producer.operands[:-1]
+            )
+            return all(available_input(operand) for operand in inputs)
+        return False
+
+    def available(user):
+        inputs = user.opview.inputs if user.name == "linalg.generic" else user.operands
+        return all(available_input(value) for value in inputs)
 
     while len(anchor.results) == 1:
         uses = list(anchor.results[0].uses)

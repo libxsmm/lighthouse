@@ -28,6 +28,8 @@ class TagSubgraphsOp(TransformExtensionDialect.Operation, name="tag_subgraphs"):
         Token-only expand_shape and elementwise epilogue DAGs are fused forward.
         A join belongs to the last available branch: external inputs must
         already be defined at the root matmul, avoiding cyclic kernel ordering.
+        Local elementwise setup may follow it if its inputs are available,
+        e.g. bias casts/broadcasts and ReLU zero fills.
       - "elementwise": connected elementwise linalg ops and the reshapes,
         slices, and concats between them.
 

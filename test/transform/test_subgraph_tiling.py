@@ -16,8 +16,10 @@ from lighthouse.dialects.transform.transform_ext.utils.subgraph_analysis import 
     SUBGRAPH_KIND_ATTR_NAME,
 )
 from lighthouse.execution.runner import Runner
+from lighthouse.ingress.mlir_gen import generate_gpu_matmul_payload
 from lighthouse.pipeline.helper import match
 from lighthouse.schedule import schedule_boilerplate
+from lighthouse.schedule.xegpu import cleanup_schedule
 from lighthouse.schedule.xegpu.wg_tiling_schedule import apply_subgraph_tiling
 
 
@@ -323,6 +325,60 @@ def test_shared_normalization_input():
 # CHECK-NEXT: Shared residual stays outside normalization during partitioning and tiling
 
 
+def test_late_bias_relu_setup():
+    rng = np.random.default_rng(42)
+    a = rng.integers(-3, 4, size=(256, 64)).astype(np.float32)
+    b = rng.integers(-3, 4, size=(64, 256)).astype(np.float32)
+    bias = rng.integers(-3, 4, size=256).astype(np.float32)
+    initial = rng.integers(-3, 4, size=(256, 256)).astype(np.float32)
+    for accumulate in (False, True):
+        module = generate_gpu_matmul_payload(
+            func_name="payload",
+            M=256,
+            N=256,
+            K=64,
+            ab_type=ir.F32Type.get(),
+            c_type=ir.F32Type.get(),
+            transpose_a=False,
+            transpose_b=False,
+            has_bias=True,
+            has_relu=True,
+            accumulate_c=accumulate,
+        )
+        cleanup = cleanup_schedule()
+        cleanup.body.operations[0].apply(module.operation)
+        module = run(str(module), tile)
+        (loop,) = [
+            op for op in operations(module, "scf.forall") if op.name == "scf.forall"
+        ]
+        (matmul,) = operations(module, "linalg.matmul")
+        (relu,) = operations(module, "arith.maximumf")
+        assert matmul.parent.name == "scf.for"
+        assert relu.parent.parent == loop
+        PassManager.parse(
+            "builtin.module(empty-tensor-to-alloc-tensor,"
+            "one-shot-bufferize{bufferize-function-boundaries "
+            "function-boundary-type-conversion=identity-layout-map},"
+            "scf-forall-to-for,buffer-deallocation-pipeline,"
+            "convert-linalg-to-loops,expand-strided-metadata,lower-affine,"
+            "convert-scf-to-cf,convert-math-to-llvm)"
+        ).run(module.operation)
+        Runner.make_function_callable(module, "payload")
+        PassManager.parse(
+            "builtin.module(finalize-memref-to-llvm,convert-to-llvm,"
+            "reconcile-unrealized-casts)"
+        ).run(module.operation)
+        output = initial.copy()
+        Runner(module).execute("payload", [output, a, b, bias])
+        expected = np.maximum(a @ b + (initial if accumulate else 0) + bias, 0)
+        np.testing.assert_array_equal(output, expected)
+    print("Late bias/ReLU setup fuses into one GEMM kernel and matches NumPy")
+
+
+# CHECK-LABEL: test_late_bias_relu_setup
+# CHECK-NEXT: Late bias/ReLU setup fuses into one GEMM kernel and matches NumPy
+
+
 with ir.Context(), ir.Location.unknown():
     lh_dialects.register_and_load()
     for test in (
@@ -332,6 +388,7 @@ with ir.Context(), ir.Location.unknown():
         test_numerics,
         test_mixed_reduction,
         test_shared_normalization_input,
+        test_late_bias_relu_setup,
     ):
         print(test.__name__)
         test()
