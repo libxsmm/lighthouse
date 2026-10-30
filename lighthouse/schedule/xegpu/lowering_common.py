@@ -154,7 +154,7 @@ def vectorize(
         vector.apply_patterns_vector_cast_away_vector_leading_one_dim()
         vector.apply_patterns_vector_drop_unit_dims_with_shape_cast()
     lh_transform.cleanup(payload_func)
-    transform_ext.fold_tensor_vector_transfers(payload_func)
+    payload_func = transform_ext.fold_tensor_vector_transfers(payload_func)
     lh_transform.cleanup(payload_func)
 
     # Narrow vector.contract operands if possible to match DPAS op spec.
