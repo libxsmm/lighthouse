@@ -355,6 +355,9 @@ def test_late_bias_relu_setup():
         (relu,) = operations(module, "arith.maximumf")
         assert matmul.parent.name == "scf.for"
         assert relu.parent.parent == loop
+        assert len(operations(module, "linalg.fill")) == len(
+            operations(loop, "linalg.fill")
+        ), "All fills, including shared accumulator/ReLU zeros, must fuse into the WG"
         PassManager.parse(
             "builtin.module(empty-tensor-to-alloc-tensor,"
             "one-shot-bufferize{bufferize-function-boundaries "
