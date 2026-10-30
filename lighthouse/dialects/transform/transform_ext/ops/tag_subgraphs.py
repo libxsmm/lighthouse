@@ -30,6 +30,8 @@ class TagSubgraphsOp(TransformExtensionDialect.Operation, name="tag_subgraphs"):
         already be defined at the root matmul, avoiding cyclic kernel ordering.
         Local elementwise setup may follow it if its inputs are available,
         e.g. bias casts/broadcasts and ReLU zero fills.
+        Pointwise output casts expanded across head reshapes are moved back
+        into the GEMM's 2D iteration space before matching.
       - "elementwise": connected elementwise linalg ops and the reshapes,
         slices, and concats between them.
 

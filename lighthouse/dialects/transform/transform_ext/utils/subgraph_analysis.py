@@ -21,7 +21,7 @@ from lighthouse.dialects.transform.transform_ext.ops.filter_elementwise import (
 from lighthouse.dialects.transform.transform_ext.ops.filter_reduction_ops import (
     is_reduction_op,
 )
-from lighthouse.utils.mlir import opview
+from lighthouse.utils.mlir import indexing_maps, opview
 from lighthouse.dialects.transform.transform_ext.ops.filter_contraction_ops import (
     is_contraction_op,
 )
@@ -60,8 +60,15 @@ def tag(ops: Iterable, anchor, kind: str, id: int) -> None:
         attrs[SUBGRAPH_ID_ATTR_NAME] = ir.IntegerAttr.get(i64, id)
     anchor.attributes[SUBGRAPH_ANCHOR_ATTR_NAME] = ir.UnitAttr.get()
     if kind == "attention":
-        for consumer in _forward_closure(anchor, ops)[1:]:
-            consumer.attributes[SUBGRAPH_EPILOGUE_ATTR_NAME] = ir.UnitAttr.get()
+        consumers = _forward_closure(anchor, ops)[1:]
+        # A plain result reshape is handled by reshaping the destination.
+        # A transpose/layout epilogue must instead be fused into the WG.
+        if any(
+            consumer.name not in ("tensor.expand_shape", "tensor.collapse_shape")
+            for consumer in consumers
+        ):
+            for consumer in consumers:
+                consumer.attributes[SUBGRAPH_EPILOGUE_ATTR_NAME] = ir.UnitAttr.get()
 
 
 def clear_tags(op: ir.Operation | ir.OpView) -> None:
@@ -99,6 +106,83 @@ def _is_linalg(op: ir.Operation) -> bool:
 
 def _is_elementwise_linalg(op: ir.Operation) -> bool:
     return _is_linalg(op) and is_elementwise(op)
+
+
+def _is_cast_generic(op: ir.Operation) -> bool:
+    if op.name != "linalg.generic" or len(op.results) != 1:
+        return False
+    generic = op.opview
+    body = generic.regions[0].blocks[0]
+    operations = list(body.operations)
+    return (
+        len(generic.inputs) == 1
+        and len(generic.outputs) == 1
+        and len(operations) == 2
+        and operations[0].name in ("arith.extf", "arith.truncf")
+        and list(operations[0].operands) == [body.arguments[0]]
+        and operations[1].name == "linalg.yield"
+        and list(operations[1].operands) == list(operations[0].results)
+        and all(
+            mapping == ir.AffineMap.get_identity(mapping.n_dims)
+            for mapping in indexing_maps(generic)
+        )
+    )
+
+
+def _fold_gemm_cast_reshape(op: ir.Operation) -> None:
+    """Keep a projection's pointwise cast in its 2D GEMM iteration space."""
+    if is_tagged(op) or len(op.results) != 1:
+        return
+    source_type = op.results[0].type
+    if (
+        not isinstance(source_type, ir.RankedTensorType)
+        or source_type.rank != 2
+        or source_type.encoding is not None
+        or any(size <= 0 for size in source_type.shape)
+    ):
+        return
+    for reshape in list(_users(op)):
+        if reshape.name != "tensor.expand_shape" or is_tagged(reshape):
+            continue
+        if len(list(reshape.opview.reassociation)[-1]) == 1:
+            continue
+        for cast in list(_users(reshape)):
+            if (
+                is_tagged(cast)
+                or not _is_cast_generic(cast)
+                or cast.operands[0] != reshape.results[0]
+            ):
+                continue
+            result_type = ir.RankedTensorType(cast.results[0].type)
+            if result_type.encoding is not None or any(
+                size <= 0 for size in result_type.shape
+            ):
+                continue
+            shape = source_type.shape
+            with ir.InsertionPoint(reshape), cast.location:
+                empty = tensor.EmptyOp(shape, result_type.element_type)
+                folded = cast.clone()
+                folded.operands[0] = op.results[0]
+                folded.operands[1] = empty.result
+                folded.results[0].set_type(empty.result.type)
+                identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(2))
+                folded.attributes["indexing_maps"] = ir.ArrayAttr.get(
+                    [identity, identity]
+                )
+                folded.attributes["iterator_types"] = ir.ArrayAttr.get(
+                    list(cast.attributes["iterator_types"])[:2]
+                )
+                expanded = tensor.ExpandShapeOp(
+                    result_type,
+                    folded.results[0],
+                    reshape.opview.reassociation,
+                    [],
+                    result_type.shape,
+                )
+            cast.results[0].replace_all_uses_with(expanded.result)
+            cast.erase()
+        if not _users(reshape):
+            reshape.erase()
 
 
 def _clone_for(producer: ir.Operation, members: list) -> ir.Operation:
@@ -380,10 +464,17 @@ def _match_attention(root, block_ops):
             return False
         if _contains(op, {"arith.addf", "arith.subf", "arith.negf"}):
             return False
-        if any(
-            p is not None and p.name == "linalg.matmul"
-            for p in map(_producer, op.operands)
-        ):
+
+        def from_matmul(value):
+            producer = _producer(value)
+            while producer is not None and producer.name in (
+                "tensor.expand_shape",
+                "tensor.collapse_shape",
+            ):
+                producer = _producer(producer.operands[0])
+            return producer is not None and producer.name == "linalg.matmul"
+
+        if any(from_matmul(value) for value in op.operands):
             return False
         return not _contains(op, {"arith.mulf"}) or len(op.opview.inputs) <= 1
 
@@ -433,6 +524,11 @@ def tag_subgraphs(block: ir.Block, kinds: Iterable[str]) -> list[ir.Operation]:
     """Tag the subgraphs of `kinds` (in order) among the ops of `block`.
 
     Returns the linalg ops of `block` that are left untagged."""
+    kinds = tuple(kinds)
+    if "gemm" in kinds:
+        for op in list(block.operations):
+            if op.name == "linalg.matmul":
+                _fold_gemm_cast_reshape(op.operation)
     next_id = 1 + max(
         (subgraph_id(o) or 0 for o in block.operations),
         default=0,

@@ -462,6 +462,50 @@ def test_mlp_accumulators():
 # CHECK-NEXT: MLP hidden accumulators start at zero; only the final output accumulates
 
 
+def test_expanded_projection_cast():
+    source = """
+func.func @projection(%a: tensor<256x64xf32>, %b: tensor<64x256xf32>)
+    -> tensor<2x128x4x64xf16> {
+  %zero = arith.constant 0.0 : f32
+  %empty = tensor.empty() : tensor<256x256xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<256x256xf32>)
+    -> tensor<256x256xf32>
+  %p = linalg.matmul ins(%a, %b : tensor<256x64xf32>, tensor<64x256xf32>)
+    outs(%init : tensor<256x256xf32>) -> tensor<256x256xf32>
+  %expanded = tensor.expand_shape %p [[0,1],[2,3]] output_shape [2,128,4,64]
+    : tensor<256x256xf32> into tensor<2x128x4x64xf32>
+  %out = tensor.empty() : tensor<2x128x4x64xf16>
+  %cast = linalg.generic {
+      indexing_maps = [affine_map<(a,b,c,d)->(a,b,c,d)>,
+                       affine_map<(a,b,c,d)->(a,b,c,d)>],
+      iterator_types = ["parallel","parallel","parallel","parallel"]}
+    ins(%expanded : tensor<2x128x4x64xf32>) outs(%out : tensor<2x128x4x64xf16>) {
+  ^bb0(%x: f32, %o: f16):
+    %v = arith.truncf %x : f32 to f16
+    linalg.yield %v : f16
+  } -> tensor<2x128x4x64xf16>
+  return %cast : tensor<2x128x4x64xf16>
+}
+"""
+    module = run(
+        source, lambda func: transform_ext.tag_subgraphs(func, ["gemm", "elementwise"])
+    )
+    (cast,) = operations(module, "arith.truncf")
+    assert list(cast.parent.results[0].type.shape) == [256, 256]
+    assert SUBGRAPH_ANCHOR_ATTR_NAME in cast.parent.attributes
+    assert cast.parent.operands[0].owner.name == "linalg.matmul"
+    module = run(source, tile)
+    (loop,) = [op for op in operations(module, "scf.forall") if op.name == "scf.forall"]
+    assert len(operations(loop, "arith.truncf")) == 1
+    assert len(operations(loop, "linalg.matmul")) == 1
+    assert list(loop.results[0].type.shape) == [256, 256]
+    print("Expanded projection casts stay in the 2D GEMM epilogue")
+
+
+# CHECK-LABEL: test_expanded_projection_cast
+# CHECK-NEXT: Expanded projection casts stay in the 2D GEMM epilogue
+
+
 with ir.Context(), ir.Location.unknown():
     lh_dialects.register_and_load()
     for test in (
@@ -473,6 +517,7 @@ with ir.Context(), ir.Location.unknown():
         test_shared_normalization_input,
         test_late_bias_relu_setup,
         test_mlp_accumulators,
+        test_expanded_projection_cast,
     ):
         print(test.__name__)
         test()
