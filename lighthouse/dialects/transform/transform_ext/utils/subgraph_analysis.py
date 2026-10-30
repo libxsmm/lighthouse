@@ -241,7 +241,12 @@ def _match_gemm(op: ir.Operation, block_ops) -> list[tuple[list, ir.Operation]]:
         if len(uses) != 1:
             break
         user = uses[0].owner.operation
-        if is_tagged(user) or not _is_elementwise_linalg(user) or not available(user):
+        if (
+            user not in block_ops
+            or is_tagged(user)
+            or not _is_elementwise_linalg(user)
+            or not available(user)
+        ):
             break
         members.append(user)
         anchor = user
@@ -274,6 +279,7 @@ def _match_gemm(op: ir.Operation, block_ops) -> list[tuple[list, ir.Operation]]:
             producer = _producer(value)
             if (
                 producer is None
+                or producer not in block_ops
                 or producer in members
                 or is_tagged(producer)
                 or not _is_elementwise_linalg(producer)
@@ -307,8 +313,10 @@ def _match_elementwise(
     without such an op are left untagged."""
 
     def candidate(o):
-        return not is_tagged(o) and (
-            _is_elementwise_linalg(o) or isinstance(o.opview, _DATA_MOVEMENT_OPS)
+        return (
+            o in block_ops
+            and not is_tagged(o)
+            and (_is_elementwise_linalg(o) or isinstance(o.opview, _DATA_MOVEMENT_OPS))
         )
 
     if not candidate(op):

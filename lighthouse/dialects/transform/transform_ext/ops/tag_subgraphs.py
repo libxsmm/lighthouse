@@ -37,6 +37,8 @@ class TagSubgraphsOp(TransformExtensionDialect.Operation, name="tag_subgraphs"):
 
     Produces a silenceable failure if some linalg op in a target body is left
     untagged.
+    Consumes target handles because normalization can replace nested ops.
+    Reacquire member handles through the returned containers.
 
     Args:
         target: Handle to op(s) with a single-block region, e.g. func.func.
@@ -70,6 +72,14 @@ class TagSubgraphsOp(TransformExtensionDialect.Operation, name="tag_subgraphs"):
                 )
                 return DiagnosedSilenceableFailure.DefiniteFailure
             targets = state.get_payload_ops(op.target)
+            if any(
+                len(target.regions) != 1 or len(target.regions[0].blocks) != 1
+                for target in targets
+            ):
+                op.location.emit_error(
+                    "tag_subgraphs: expected targets with one single-block region"
+                )
+                return DiagnosedSilenceableFailure.SilenceableFailure
             untagged = []
             for target in targets:
                 for region in target.regions:
@@ -88,7 +98,7 @@ class TagSubgraphsOp(TransformExtensionDialect.Operation, name="tag_subgraphs"):
         @staticmethod
         def get_effects(op: ir.Operation):
             return (
-                transform.only_reads_handle(op.op_operands)
+                transform.consumes_handle(op.op_operands)
                 + transform.produces_handle(op.results)
                 + transform.modifies_payload()
             )
