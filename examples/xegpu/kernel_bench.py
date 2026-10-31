@@ -492,14 +492,16 @@ def infer_params_and_lower(
         layer["kind"] in ("reduction", "batch_matmul")
         for layer in func_metadata["layers"]
     )
+    cached_file_exists = os.path.isfile(params_cache_json)
     if (
         enable_tuning
         and len(matmuls) == 1
         and schedule_kind == "mlp"
         and not mixed_kernel_graph
+        and (stop_at_stage is None or cached_file_exists)
     ):
         # runtime tuning for matmul kernels
-        if os.path.isfile(params_cache_json):
+        if cached_file_exists:
             print(f"Loading cached parameters from {params_cache_json}")
             schedule_params = ScheduleParameters.from_json(filename=params_cache_json)
         else:
@@ -866,6 +868,15 @@ def lower_and_execute_benchmark(
                 torch_model = torch_model.to("xpu")
                 result_ref = torch_model(*torch_inputs).to("cpu")
 
+    # Generate parameter json file name
+    if level > 0:
+        # KernelBench kernel, use level and id
+        params_cache_json = f"kb_params_level{level}-{id}.json"
+    else:
+        # custom kernel, use filename
+        stem = Path(filepath).stem.replace("_", "-")
+        params_cache_json = f"kb_params_{stem}.json"
+
     # compile and execute the model with the MLIR backend
     torch_all_inputs = [*torch_model.parameters(), *torch_inputs]
     # get payload metadata as a side effect
@@ -877,9 +888,9 @@ def lower_and_execute_benchmark(
         benchmark=True,
         payload_func_name="main",
         stop_at_stage=stop_at_stage,
-        params_cache_json=f"kb_params_level{level}-{id}.json",
+        params_cache_json=params_cache_json,
         dump_parameters=dump_parameters,
-        enable_tuning=execute,
+        enable_tuning=True,
         verbose=verbose,
     )
     backend = gpu_backend(
