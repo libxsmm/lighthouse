@@ -213,8 +213,55 @@ def test_unknown_and_conflicting_paths():
 # CHECK: Unsupported, unrelated and conflicting paths do not acquire a guessed layout
 
 
+def test_uniform_initialization():
+    for value in ("0.0", "1.0"):
+        result = run(
+            128,
+            [4, 8],
+            [32, 32],
+            f"%result = arith.constant dense<{value}> : vector<128x256xbf16>",
+            [128, 256],
+        )
+        assert result == ir.Attribute.parse(
+            "#xegpu.layout<sg_layout=[4,8],sg_data=[32,32],inst_data=[8,16]>"
+        )
+    transposed = run(
+        256,
+        [8, 4],
+        [32, 64],
+        """
+  %zero = arith.constant dense<0.0> : vector<256x256xbf16>
+  %t = vector.transpose %v, [1,0] : vector<256x256xbf16> to vector<256x256xbf16>
+  %result = arith.addf %zero, %t : vector<256x256xbf16>
+""",
+        [256, 256],
+    )
+    assert transposed == ir.Attribute.parse(
+        "#xegpu.layout<sg_layout=[4,8],sg_data=[64,32],inst_data=[16,8],order=[0,1]>"
+    )
+    module = ir.Module.parse(
+        source(
+            128,
+            256,
+            "%result = arith.constant dense<[0.0, 1.0]> : vector<2xbf16>",
+            [2],
+        )
+    )
+    (dpas,) = operations(module, "xegpu.dpas")
+    (store,) = operations(module, "xegpu.store_nd")
+    initial = _Layout((4, 8), (32, 32), (8, 16), (1, 0))
+    assert _infer_store_layout(dpas, store, initial) is None
+    print(
+        "Uniform initialization stores accept the accumulator layout; nonuniform stores do not"
+    )
+
+
+# CHECK: Uniform initialization stores accept the accumulator layout; nonuniform stores do not
+
+
 with ir.Context(), ir.Location.unknown():
     lh_dialects.register_and_load()
     test_rope_layouts()
     test_elementwise_and_units()
     test_unknown_and_conflicting_paths()
+    test_uniform_initialization()

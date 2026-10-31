@@ -124,7 +124,18 @@ def _infer_store_layout(source, store, layout):
         known[value] = inferred
         return inferred
 
-    return infer(store.operands[0])
+    stored = store.operands[0]
+    if not isinstance(stored.owner, ir.Block):
+        owner = stored.owner.operation
+        if owner.name == "arith.constant":
+            constant = owner.attributes["value"]
+            if isinstance(constant, ir.DenseElementsAttr) and constant.is_splat:
+                return _reshape(
+                    layout,
+                    list(ir.VectorType(source.results[0].type).shape),
+                    list(ir.VectorType(stored.type).shape),
+                )
+    return infer(stored)
 
 
 class InferGemmStoreLayoutOp(
@@ -143,6 +154,9 @@ class InferGemmStoreLayoutOp(
     not the store. Returns a layout attribute param for transform.annotate;
     unlike xegpu.set_anchor_layout this permits an inferred, rank-varying order.
     Dimension renumbering preserves both tile ownership and subgroup ID order.
+    Uniform constant stores (e.g. accumulator initialization before a GEMM)
+    have unconstrained ownership and use the chosen accumulator layout, with
+    the same supported shape adjustments. Nonuniform unrelated stores fail.
     """
 
     source: ext.Operand[transform.AnyOpType]
